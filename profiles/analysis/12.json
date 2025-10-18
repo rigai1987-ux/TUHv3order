@@ -1,0 +1,27 @@
+{
+  "position_size": 100.0,
+  "commission": 0.1,
+  "entry_logic_mode": "Принты и HLdir",
+  "hldir_offset": 5,
+  "aggressive_mode": false,
+  "start_date": "2025-09-01",
+  "end_date": "2025-09-26",
+  "selected_files": [
+    "HEMIUSDT-klines-1s-2025-09-01_to_2025-09-02.csv"
+  ],
+  "vol_period": 14,
+  "vol_pctl": 1.0,
+  "range_period": 1,
+  "rng_pctl": 1.0,
+  "natr_period": 1,
+  "natr_min": 0.1,
+  "lookback_period": 35,
+  "min_growth_pct": 2.0,
+  "prints_analysis_period": 1,
+  "stop_loss_pct": 1.0,
+  "take_profit_pct": 2.0,
+  "enable_additional_filters": false,
+  "prints_threshold_ratio": 1.77,
+  "hldir_window": 10,
+  "name": "12"
+}

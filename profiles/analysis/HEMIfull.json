@@ -1,0 +1,33 @@
+{
+  "position_size": 100.0,
+  "commission": 0.1,
+  "entry_logic_mode": "Принты и HLdir",
+  "hldir_offset": 5,
+  "aggressive_mode": false,
+  "start_date": "2025-09-01",
+  "end_date": "2025-09-26",
+  "vol_period": 10,
+  "vol_pctl": 1.0,
+  "range_period": 4,
+  "rng_pctl": 1.0,
+  "m_analysis_period": 2,
+  "m_threshold_ratio": 1.51,
+  "use_m_ratio_filter": false,
+  "enable_additional_filters": false,
+  "natr_period": 56,
+  "natr_min": 0.31,
+  "lookback_period": 80,
+  "min_growth_pct": 1.0,
+  "prints_analysis_period": 2,
+  "stop_loss_pct": 2.06,
+  "take_profit_pct": 5.94,
+  "prints_threshold_ratio": 1.99,
+  "hldir_window": 10,
+  "use_climax_exit": true,
+  "climax_exit_window": 8,
+  "climax_exit_threshold": 14.95,
+  "selected_files": [
+    "HEMIUSDT-klines-1s-2025-09-01_to_2025-09-30.parquet"
+  ],
+  "name": "HEMIfull"
+}

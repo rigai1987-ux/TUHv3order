@@ -1,0 +1,30 @@
+{
+  "position_size": 100.0,
+  "commission": 0.1,
+  "entry_logic_mode": "Принты и HLdir",
+  "hldir_offset": 5,
+  "aggressive_mode": false,
+  "start_date": "2025-09-01",
+  "end_date": "2025-09-26",
+  "selected_files": [
+    "HEMIUSDT-klines-1s-2025-09-01_to_2025-09-02.csv"
+  ],
+  "vol_period": 4,
+  "vol_pctl": 1.0,
+  "range_period": 1,
+  "rng_pctl": 1.0,
+  "natr_period": 86,
+  "natr_min": 0.18,
+  "lookback_period": 39,
+  "min_growth_pct": 0.58,
+  "prints_analysis_period": 2,
+  "stop_loss_pct": 1.35,
+  "take_profit_pct": 5.8,
+  "enable_additional_filters": false,
+  "prints_threshold_ratio": 1.76,
+  "hldir_window": 10,
+  "use_climax_exit": true,
+  "climax_exit_window": 8,
+  "climax_exit_threshold": 14.0,
+  "name": "HEMI8-14"
+}
