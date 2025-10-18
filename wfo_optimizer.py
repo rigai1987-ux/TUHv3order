@@ -159,10 +159,14 @@ def run_wfo(
             look_forward_period = wfo_params.get('look_forward_period', 20)
             profit_target_pct = wfo_params.get('profit_target_pct', 2.0)
             loss_limit_pct = wfo_params.get('loss_limit_pct', 1.0)
+            # Для разметки используем средние значения из пространства поиска, если они есть
+            bracket_offset_pct = (opt_params['param_space']['bracket_offset_pct'][1] + opt_params['param_space']['bracket_offset_pct'][2]) / 2
+            bracket_timeout_candles = int((opt_params['param_space']['bracket_timeout_candles'][1] + opt_params['param_space']['bracket_timeout_candles'][2]) / 2)
             
             promising_long, promising_short = find_future_outcomes(
-                train_data['high'].values, train_data['low'].values,
-                int(look_forward_period), profit_target_pct / 100, loss_limit_pct / 100
+                train_data['close'].values, train_data['high'].values, train_data['low'].values, train_data['open'].values,
+                int(look_forward_period), profit_target_pct / 100, loss_limit_pct / 100,
+                bracket_offset_pct / 100, bracket_timeout_candles
             )
             train_data['promising_long'] = promising_long
             train_data['promising_short'] = promising_short

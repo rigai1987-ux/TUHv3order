@@ -18,8 +18,8 @@ if CATBOOST_AVAILABLE:
     CLASSIFIER_MAPPING["CatBoost"] = CatBoostClassifier
 
 # --- Глобальный кэш для ускорения повторных вычислений в Optuna/WFO ---
-# Ключ - хэш от параметров, Значение - (признаки, цель, скейлер)
-ML_DATA_CACHE = {} # type: ignore
+# Ключ - хэш от параметров, Значение - (DataFrame с признаками, целевая переменная)
+ML_DATA_CACHE = {}
 
 def train_ml_model(df: pd.DataFrame, params: dict, signal_indices: list):
     """
@@ -60,7 +60,7 @@ def train_ml_model(df: pd.DataFrame, params: dict, signal_indices: list):
 
     # 2. Проверяем кэш
     if cache_key in ML_DATA_CACHE:
-        feature_df, target, scaler, ml_feature_gen_used_params = ML_DATA_CACHE[cache_key]
+        feature_df, target, ml_feature_gen_used_params = ML_DATA_CACHE[cache_key]
         used_params.update(ml_feature_gen_used_params)
     else:
         # Если в кэше нет, выполняем дорогостоящие вычисления
@@ -77,28 +77,25 @@ def train_ml_model(df: pd.DataFrame, params: dict, signal_indices: list):
         # 2. Определяем целевую переменную (y)
         profit_target_for_labeling = params.get("take_profit_pct", 4.0)
         loss_limit_for_labeling = params.get("stop_loss_pct", 2.0)
-        look_forward_for_labeling = params.get("bracket_timeout_candles", 5) * 5
+        # Горизонт разметки должен быть достаточно большим
+        look_forward_for_labeling = params.get("bracket_timeout_candles", 5) * 5 
+        bracket_offset_for_labeling = params.get("bracket_offset_pct", 0.5)
 
         promising_long, _ = find_future_outcomes(
-            df['high'].values, df['low'].values,
+            df['close'].values, df['high'].values, df['low'].values, df['open'].values,
             look_forward_period=look_forward_for_labeling,
             profit_target_ratio=profit_target_for_labeling / 100,
-            loss_limit_ratio=loss_limit_for_labeling / 100
+            loss_limit_ratio=loss_limit_for_labeling / 100,
+            bracket_offset_ratio=bracket_offset_for_labeling / 100,
+            bracket_timeout_candles=params.get("bracket_timeout_candles", 5)
         )
         target = np.zeros(len(df))
         target[promising_long] = 1
 
-        # 3. Подготавливаем scaler
-        X_for_scaler = feature_df.loc[signal_indices]
-        scaler = StandardScaler()
-        logging.info(f"[ML Handler] Подготовка Scaler на {len(X_for_scaler)} сигналах.")
-        if len(X_for_scaler) > 0:
-            scaler.fit(X_for_scaler)
+        # 3. Сохраняем результат в кэш (без scaler)
+        ML_DATA_CACHE[cache_key] = (feature_df, target, ml_feature_gen_used_params)
 
-        # 4. Сохраняем результат в кэш
-        ML_DATA_CACHE[cache_key] = (feature_df, target, scaler, ml_feature_gen_used_params)
-
-    # --- Обучение модели ---
+    # --- Подготовка данных и обучение модели ---
     used_params.add("classifier_type")
     X = feature_df.loc[signal_indices]
     y = target[signal_indices]
@@ -117,8 +114,12 @@ def train_ml_model(df: pd.DataFrame, params: dict, signal_indices: list):
                           "Модели не на чем учиться. Попробуйте изменить параметры разметки "
                           "(SL/TP, горизонт скрининга) или базовые фильтры стратегии.")
     else:
+        # --- ИСПРАВЛЕНИЕ: Scaler создается и обучается здесь, на актуальных данных ---
+        scaler = StandardScaler()
+        logging.info(f"[ML Handler] Обучение Scaler и модели '{classifier_type}' на {len(X)} сигналах.")
+        X_scaled = scaler.fit_transform(X) # Используем fit_transform
+
         logging.info(f"[ML Handler] Запуск обучения модели '{classifier_type}' на {len(X)} сигналах.")
-        X_scaled = scaler.transform(X)
         model_class = CLASSIFIER_MAPPING[classifier_type] # type: ignore
         model_init_params = {k.replace(classifier_type.lower() + '_', ''): v for k, v in params.items() if k.startswith(classifier_type.lower() + '_')}
         used_params.update([k for k in params.keys() if k.startswith(classifier_type.lower() + '_')])

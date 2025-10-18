@@ -54,51 +54,63 @@ def calculate_natr(high, low, close, period):
     return natr
 
 @numba.jit(nopython=True, cache=True)
-def find_future_outcomes(high_prices, low_prices, look_forward_period, profit_target_ratio, loss_limit_ratio):
+def find_future_outcomes(
+    close_prices, high_prices, low_prices, open_prices,
+    look_forward_period, profit_target_ratio, loss_limit_ratio,
+    bracket_offset_ratio, bracket_timeout_candles
+):
     """
     Numba-ускоренная функция для поиска "перспективных" сигналов.
-    Для каждой свечи определяет, достигла ли цена в будущем тейк-профита раньше стоп-лосса.
+    Для каждой свечи i симулирует вход по "вилке" и определяет,
+    достигла ли цена в будущем тейк-профита раньше стоп-лосса.
     """
     n = len(high_prices)
     promising_long = np.zeros(n, dtype=numba.boolean)
     promising_short = np.zeros(n, dtype=numba.boolean)
 
-    for i in range(n - look_forward_period):
-        base_price = high_prices[i] # Используем high как базовую цену для консервативной оценки
+    # Уменьшаем основной цикл, чтобы избежать выхода за пределы массива
+    for i in range(n - (bracket_timeout_candles + look_forward_period)):
+        # --- Этап 1: Симуляция входа по "вилке" ---
+        signal_close_price = close_prices[i]
+        long_level = signal_close_price * (1 + bracket_offset_ratio)
+        short_level = signal_close_price * (1 - bracket_offset_ratio)
 
-        # Цели для Long
-        long_take_profit_price = base_price * (1 + profit_target_ratio)
-        long_stop_loss_price = base_price * (1 - loss_limit_ratio)
+        entry_idx = -1
+        entry_price = -1.0
+        direction_is_long = True
 
-        # Цели для Short
-        short_take_profit_price = base_price * (1 - profit_target_ratio)
-        short_stop_loss_price = base_price * (1 + loss_limit_ratio)
+        # Ищем вход в пределах окна ожидания
+        for j in range(i + 1, i + 1 + bracket_timeout_candles):
+            hit_long = high_prices[j] >= long_level
+            hit_short = low_prices[j] <= short_level
 
-        long_found = False
-        short_found = False
-
-        for j in range(i + 1, i + 1 + look_forward_period):
-            # Проверка для Long
-            if not long_found:
-                if low_prices[j] <= long_stop_loss_price:
-                    long_found = True # Стоп сработал, прекращаем поиск для long
-                    promising_long[i] = False
-                if high_prices[j] >= long_take_profit_price:
-                    long_found = True # Тейк сработал, прекращаем поиск для long
-                    promising_long[i] = True # Сработал тейк, сигнал перспективный
-
-            # Проверка для Short (можно делать параллельно в том же цикле)
-            if not short_found:
-                 if high_prices[j] >= short_stop_loss_price:
-                    short_found = True # Стоп сработал, прекращаем поиск для short
-                    promising_short[i] = False 
-                 if low_prices[j] <= short_take_profit_price:
-                    short_found = True # Тейк сработал, прекращаем поиск для short
-                    promising_short[i] = True
-            
-            # Если оба исхода найдены, можно досрочно выйти из цикла по j
-            if long_found and short_found:
+            if hit_long and not hit_short:
+                entry_idx, entry_price, direction_is_long = j, max(long_level, open_prices[j]), True
                 break
+            if hit_short and not hit_long:
+                entry_idx, entry_price, direction_is_long = j, min(short_level, open_prices[j]), False
+                break
+            if hit_long and hit_short: # Неоднозначный вход, пропускаем для простоты разметки
+                entry_idx = -1
+                break
+
+        # Если входа не произошло за таймаут, переходим к следующей свече i
+        if entry_idx == -1:
+            continue
+
+        # --- Этап 2: Поиск исхода (SL/TP) после входа ---
+        if direction_is_long:
+            take_profit_price = entry_price * (1 + profit_target_ratio)
+            stop_loss_price = entry_price * (1 - loss_limit_ratio)
+            # Ищем исход в будущем
+            for k in range(entry_idx, entry_idx + look_forward_period):
+                if low_prices[k] <= stop_loss_price:
+                    promising_long[i] = False
+                    break # Нашли исход (убыток)
+                if high_prices[k] >= take_profit_price:
+                    promising_long[i] = True
+                    break # Нашли исход (прибыль)
+        # Логика для Short пока не требуется, но может быть добавлена аналогично
 
     return promising_long, promising_short
 
@@ -214,8 +226,8 @@ def generate_signals(df, params, base_signal_only=False):
 
     
     # Заполняем NaN в начале, которые могут возникнуть из-за скользящего окна
-    volume_percentiles = pd.Series(volume_percentiles).bfill().values
-    range_percentiles = pd.Series(range_percentiles).bfill().values
+    volume_percentiles = pd.Series(volume_percentiles).ffill().values
+    range_percentiles = pd.Series(range_percentiles).ffill().values
     used_params.update({"natr_period", "natr_min"})
     used_params.update({"lookback_period", "min_growth_pct"})
 
