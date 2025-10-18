@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import numba
 import math
-
+from app_utils import find_bracket_entry
 
 import time
 def calculate_true_range(high, low, close):
@@ -54,51 +54,63 @@ def calculate_natr(high, low, close, period):
     return natr
 
 @numba.jit(nopython=True, cache=True)
-def find_future_outcomes(high_prices, low_prices, look_forward_period, profit_target_ratio, loss_limit_ratio):
-    """
-    Numba-ускоренная функция для поиска "перспективных" сигналов.
-    Для каждой свечи определяет, достигла ли цена в будущем тейк-профита раньше стоп-лосса.
-    """
+def find_future_outcomes(
+    high_prices,
+    low_prices,
+    close_prices,
+    open_prices,
+    hldir_values,
+    look_forward_period,
+    profit_target_ratio,
+    loss_limit_ratio,
+    bracket_offset_pct,
+    bracket_timeout_candles
+):
     n = len(high_prices)
     promising_long = np.zeros(n, dtype=numba.boolean)
     promising_short = np.zeros(n, dtype=numba.boolean)
 
     for i in range(n - look_forward_period):
-        base_price = high_prices[i] # Используем high как базовую цену для консервативной оценки
+        base_price = close_prices[i]
+        long_level = base_price * (1 + bracket_offset_pct / 100)
+        short_level = base_price * (1 - bracket_offset_pct / 100)
 
-        # Цели для Long
-        long_take_profit_price = base_price * (1 + profit_target_ratio)
-        long_stop_loss_price = base_price * (1 - loss_limit_ratio)
+        entry_idx, entry_price, direction = find_bracket_entry(
+            start_idx=i + 1,
+            timeout=bracket_timeout_candles,
+            long_level=long_level,
+            short_level=short_level,
+            high_prices=high_prices,
+            low_prices=low_prices,
+            open_prices=open_prices,
+            hldir_values=hldir_values,
+            close_prices=close_prices
+        )
 
-        # Цели для Short
-        short_take_profit_price = base_price * (1 - profit_target_ratio)
-        short_stop_loss_price = base_price * (1 + loss_limit_ratio)
+        if entry_idx != -1 and direction != "none":
+            if direction == "long":
+                take_profit_price = entry_price * (1 + profit_target_ratio)
+                stop_loss_price = entry_price * (1 - loss_limit_ratio)
 
-        long_found = False
-        short_found = False
-
-        for j in range(i + 1, i + 1 + look_forward_period):
-            # Проверка для Long
-            if not long_found:
-                if low_prices[j] <= long_stop_loss_price:
-                    long_found = True # Стоп сработал, прекращаем поиск для long
-                    promising_long[i] = False
-                if high_prices[j] >= long_take_profit_price:
-                    long_found = True # Тейк сработал, прекращаем поиск для long
-                    promising_long[i] = True # Сработал тейк, сигнал перспективный
-
-            # Проверка для Short (можно делать параллельно в том же цикле)
-            if not short_found:
-                 if high_prices[j] >= short_stop_loss_price:
-                    short_found = True # Стоп сработал, прекращаем поиск для short
-                    promising_short[i] = False 
-                 if low_prices[j] <= short_take_profit_price:
-                    short_found = True # Тейк сработал, прекращаем поиск для short
-                    promising_short[i] = True
+                for j in range(entry_idx, min(entry_idx + look_forward_period, n)):
+                    if low_prices[j] <= stop_loss_price:
+                        promising_long[i] = False
+                        break
+                    if high_prices[j] >= take_profit_price:
+                        promising_long[i] = True
+                        break
             
-            # Если оба исхода найдены, можно досрочно выйти из цикла по j
-            if long_found and short_found:
-                break
+            elif direction == "short":
+                take_profit_price = entry_price * (1 - profit_target_ratio)
+                stop_loss_price = entry_price * (1 + loss_limit_ratio)
+
+                for j in range(entry_idx, min(entry_idx + look_forward_period, n)):
+                    if high_prices[j] >= stop_loss_price:
+                        promising_short[i] = False
+                        break
+                    if low_prices[j] <= take_profit_price:
+                        promising_short[i] = True
+                        break
 
     return promising_long, promising_short
 

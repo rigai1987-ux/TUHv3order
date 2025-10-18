@@ -80,10 +80,16 @@ def train_ml_model(df: pd.DataFrame, params: dict, signal_indices: list):
         look_forward_for_labeling = params.get("bracket_timeout_candles", 5) * 5
 
         promising_long, _ = find_future_outcomes(
-            df['high'].values, df['low'].values,
+            df['high'].values,
+            df['low'].values,
+            df['close'].values,
+            df['open'].values,
+            df['HLdir'].values,
             look_forward_period=look_forward_for_labeling,
             profit_target_ratio=profit_target_for_labeling / 100,
-            loss_limit_ratio=loss_limit_for_labeling / 100
+            loss_limit_ratio=loss_limit_for_labeling / 100,
+            bracket_offset_pct=params.get("bracket_offset_pct", 0.5),
+            bracket_timeout_candles=params.get("bracket_timeout_candles", 5)
         )
         target = np.zeros(len(df))
         target[promising_long] = 1

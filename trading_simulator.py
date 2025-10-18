@@ -7,6 +7,7 @@ from plotly.subplots import make_subplots
 from signal_generator import generate_signals, find_future_outcomes # type: ignore
 # --- ИЗМЕНЕНИЕ: Импортируем новый обработчик ML ---
 from ml_model_handler import train_ml_model
+from app_utils import find_bracket_entry
 
 try:
     from catboost import CatBoostClassifier
@@ -324,7 +325,8 @@ class TradingSimulator:
                 high_prices=high_prices,
                 low_prices=low_prices,
                 open_prices=open_prices,
-                hldir_values=hldir_values
+                hldir_values=hldir_values,
+                close_prices=close_prices
             )
             # Направление и цена входа уже определены функцией find_bracket_entry
             direction = direction_str if direction_str != "none" else None
@@ -506,51 +508,6 @@ def find_first_exit(
                     return i, 'climax_exit', close_prices[i]
 
     return len(high_prices) - 1, 'end_of_data', close_prices[-1]
-
-@numba.jit(nopython=True, cache=True)
-def find_bracket_entry(
-    start_idx: int,
-    timeout: int,
-    long_level: float,
-    short_level: float,
-    high_prices: np.ndarray,
-    low_prices: np.ndarray,
-    open_prices: np.ndarray,
-    hldir_values: np.ndarray
-):
-    """
-    Numba-ускоренная функция для поиска первого входа по "вилке".
-    """
-    end_idx = min(start_idx + timeout, len(high_prices))
-    for i in range(start_idx, end_idx):
-        high = high_prices[i]
-        low = low_prices[i]
-
-        hit_long = high >= long_level
-        hit_short = low <= short_level
-
-        # Случай 1: Однозначный пробой в одну сторону
-        if hit_long and not hit_short:
-            # Вход по long. Если open > long_level, то это проскальзывание.
-            entry_price = max(long_level, open_prices[i])
-            return i, entry_price, "long"
-        
-        if hit_short and not hit_long:
-            # Вход по short. Если open < short_level, то это проскальзывание.
-            entry_price = min(short_level, open_prices[i])
-            return i, entry_price, "short"
-
-        # Случай 2: Неоднозначный пробой в обе стороны за одну свечу
-        if hit_long and hit_short:
-            # Используем HLdir для принятия решения
-            if hldir_values[i] == 1: # Если HLdir указывает на силу покупателей
-                entry_price = max(long_level, open_prices[i])
-                return i, entry_price, "long"
-            else: # Если HLdir == 0, указывает на силу продавцов
-                entry_price = min(short_level, open_prices[i])
-                return i, entry_price, "short"
-
-    return -1, -1.0, "none" # Тайм-аут или одновременный пробой
 
 def run_grouped_trading_simulation(df, params, screening_mode=False):
     """
