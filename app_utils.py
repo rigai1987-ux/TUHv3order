@@ -5,6 +5,8 @@ import os
 from datetime import datetime
 import re
 import tempfile
+import numpy as np
+import numba
 
 def _sanitize_filename(filename: str) -> str:
     """
@@ -471,3 +473,49 @@ def load_run_data_cached(run_file):
     except Exception as e:
         st.error(f"Ошибка при загрузке прогона '{run_file}': {str(e)}")
         return None
+
+@numba.jit(nopython=True, cache=True)
+def find_bracket_entry(
+    start_idx: int,
+    timeout: int,
+    long_level: float,
+    short_level: float,
+    high_prices: np.ndarray,
+    low_prices: np.ndarray,
+    open_prices: np.ndarray,
+    hldir_values: np.ndarray,
+    close_prices: np.ndarray
+):
+    """
+    Numba-ускоренная функция для поиска первого входа по "вилке".
+    """
+    end_idx = min(start_idx + timeout, len(high_prices))
+    for i in range(start_idx, end_idx):
+        high = high_prices[i]
+        low = low_prices[i]
+
+        hit_long = high >= long_level
+        hit_short = low <= short_level
+
+        # Случай 1: Однозначный пробой в одну сторону
+        if hit_long and not hit_short:
+            # Вход по long. Если open > long_level, то это проскальзывание.
+            entry_price = max(long_level, open_prices[i])
+            return i, entry_price, "long"
+
+        if hit_short and not hit_long:
+            # Вход по short. Если open < short_level, то это проскальзывание.
+            entry_price = min(short_level, open_prices[i])
+            return i, entry_price, "short"
+
+        # Случай 2: Неоднозначный пробой в обе стороны за одну свечу
+        if hit_long and hit_short:
+            # Используем HLdir для принятия решения
+            if hldir_values[i] == 1: # Если HLdir указывает на силу покупателей
+                entry_price = max(long_level, open_prices[i])
+                return i, entry_price, "long"
+            else: # Если HLdir == 0, указывает на силу продавцов
+                entry_price = min(short_level, open_prices[i])
+                return i, entry_price, "short"
+
+    return -1, -1.0, "none"
