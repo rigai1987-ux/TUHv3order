@@ -54,63 +54,163 @@ def calculate_natr(high, low, close, period):
     return natr
 
 @numba.jit(nopython=True, cache=True)
-def find_future_outcomes(
-    close_prices, high_prices, low_prices, open_prices,
-    look_forward_period, profit_target_ratio, loss_limit_ratio,
-    bracket_offset_ratio, bracket_timeout_candles
-):
+def find_future_outcomes(close_prices, high_prices, low_prices, open_prices, look_forward_period, profit_target_ratio, loss_limit_ratio, bracket_offset_ratio, bracket_timeout_candles):
     """
     Numba-ускоренная функция для поиска "перспективных" сигналов.
     Для каждой свечи i симулирует вход по "вилке" и определяет,
     достигла ли цена в будущем тейк-профита раньше стоп-лосса.
     """
-    n = len(high_prices)
+    n = len(close_prices)
     promising_long = np.zeros(n, dtype=numba.boolean)
     promising_short = np.zeros(n, dtype=numba.boolean)
 
-    # Уменьшаем основной цикл, чтобы избежать выхода за пределы массива
-    for i in range(n - (bracket_timeout_candles + look_forward_period)):
+    # Итерируемся по каждой возможной сигнальной свече
+    for i in range(n - look_forward_period - bracket_timeout_candles):
         # --- Этап 1: Симуляция входа по "вилке" ---
-        signal_close_price = close_prices[i]
-        long_level = signal_close_price * (1 + bracket_offset_ratio)
-        short_level = signal_close_price * (1 - bracket_offset_ratio)
+        # Уровни считаются от цены открытия следующей свечи
+        base_price = open_prices[i+1]
+        long_level = base_price * (1 + bracket_offset_ratio)
+        short_level = base_price * (1 - bracket_offset_ratio)
 
         entry_idx = -1
-        entry_price = -1.0
-        direction_is_long = True
+        entry_price = 0.0
+        is_long_trade = False
+        is_short_trade = False
 
-        # Ищем вход в пределах окна ожидания
-        for j in range(i + 1, i + 1 + bracket_timeout_candles):
-            hit_long = high_prices[j] >= long_level
-            hit_short = low_prices[j] <= short_level
+        # Ищем вход в пределах окна ожидания (таймаута)
+        for j in range(i + 1, min(i + 1 + bracket_timeout_candles, n)):
+            high = high_prices[j]
+            low = low_prices[j]
 
+            hit_long = high >= long_level
+            hit_short = low <= short_level
+
+            # Определяем вход
             if hit_long and not hit_short:
-                entry_idx, entry_price, direction_is_long = j, max(long_level, open_prices[j]), True
+                entry_idx = j
+                entry_price = max(long_level, open_prices[j])
+                is_long_trade = True
                 break
-            if hit_short and not hit_long:
-                entry_idx, entry_price, direction_is_long = j, min(short_level, open_prices[j]), False
+            elif hit_short and not hit_long:
+                entry_idx = j
+                entry_price = min(short_level, open_prices[j])
+                is_short_trade = True
                 break
-            if hit_long and hit_short: # Неоднозначный вход, пропускаем для простоты разметки
+            elif hit_long and hit_short:
+                # Неоднозначный вход, пропускаем для простоты разметки
                 entry_idx = -1
                 break
-
-        # Если входа не произошло за таймаут, переходим к следующей свече i
+        
+        # Если входа не было, переходим к следующей сигнальной свече
         if entry_idx == -1:
             continue
 
-        # --- Этап 2: Поиск исхода (SL/TP) после входа ---
-        if direction_is_long:
+        # --- Этап 2: Поиск исхода (TP/SL) после входа ---
+        outcome_found = False
+        # Ищем исход в пределах look_forward_period
+        for k in range(entry_idx, min(entry_idx + look_forward_period, n)):
+            high = high_prices[k]
+            low = low_prices[k]
+
+            if is_long_trade:
+                take_profit_price = entry_price * (1 + profit_target_ratio)
+                stop_loss_price = entry_price * (1 - loss_limit_ratio)
+                
+                if high >= take_profit_price:
+                    promising_long[i] = True
+                    outcome_found = True
+                    break
+                if low <= stop_loss_price:
+                    # promising_long[i] остается False
+                    outcome_found = True
+                    break
+            
+            elif is_short_trade:
+                take_profit_price = entry_price * (1 - profit_target_ratio)
+                stop_loss_price = entry_price * (1 + loss_limit_ratio)
+
+                if low <= take_profit_price:
+                    promising_short[i] = True
+                    outcome_found = True
+                    break
+                if high >= stop_loss_price:
+                    # promising_short[i] остается False
+                    outcome_found = True
+                    break
+        
+        # Если исход не найден в пределах окна, сигнал не считается перспективным
+        # (promising_long[i] и promising_short[i] остаются False)
+
+    return promising_long, promising_short
+
+def find_future_outcomes_vectorized(
+    close_prices, high_prices, low_prices, open_prices,
+    look_forward_period, profit_target_ratio, loss_limit_ratio,
+    bracket_offset_ratio, bracket_timeout_candles
+):
+    """
+    Векторизованная версия для поиска "перспективных" сигналов.
+    Значительно быстрее на больших данных, но может потреблять больше памяти.
+    """
+    n = len(close_prices)
+    promising_long = np.zeros(n, dtype=bool)
+    promising_short = np.zeros(n, dtype=bool)
+
+    # Итерируемся по каждой возможной сигнальной свече
+    for i in range(n - look_forward_period - bracket_timeout_candles):
+        # --- Этап 1: Симуляция входа по "вилке" ---
+        base_price = open_prices[i+1]
+        long_level = base_price * (1 + bracket_offset_ratio)
+        short_level = base_price * (1 - bracket_offset_ratio)
+
+        entry_idx = -1
+        entry_price = 0.0
+        is_long_trade = False
+
+        # Ищем вход в пределах окна ожидания
+        for j in range(i + 1, min(i + 1 + bracket_timeout_candles, n)):
+            if high_prices[j] >= long_level and low_prices[j] < long_level:
+                entry_idx = j
+                entry_price = max(long_level, open_prices[j])
+                is_long_trade = True
+                break
+            if low_prices[j] <= short_level and high_prices[j] > short_level:
+                entry_idx = j
+                entry_price = min(short_level, open_prices[j])
+                is_long_trade = False
+                break
+        
+        if entry_idx == -1:
+            continue
+
+        # --- Этап 2: Поиск исхода (TP/SL) после входа ---
+        future_highs = high_prices[entry_idx : entry_idx + look_forward_period]
+        future_lows = low_prices[entry_idx : entry_idx + look_forward_period]
+
+        if is_long_trade:
             take_profit_price = entry_price * (1 + profit_target_ratio)
             stop_loss_price = entry_price * (1 - loss_limit_ratio)
-            # Ищем исход в будущем
-            for k in range(entry_idx, entry_idx + look_forward_period):
-                if low_prices[k] <= stop_loss_price:
-                    promising_long[i] = False
-                    break # Нашли исход (убыток)
-                if high_prices[k] >= take_profit_price:
-                    promising_long[i] = True
-                    break # Нашли исход (прибыль)
-        # Логика для Short пока не требуется, но может быть добавлена аналогично
+
+            tp_hit_indices = np.where(future_highs >= take_profit_price)[0]
+            sl_hit_indices = np.where(future_lows <= stop_loss_price)[0]
+
+            first_tp_hit = tp_hit_indices[0] if len(tp_hit_indices) > 0 else np.inf
+            first_sl_hit = sl_hit_indices[0] if len(sl_hit_indices) > 0 else np.inf
+
+            if first_tp_hit < first_sl_hit:
+                promising_long[i] = True
+        else: # Short trade
+            take_profit_price = entry_price * (1 - profit_target_ratio)
+            stop_loss_price = entry_price * (1 + loss_limit_ratio)
+
+            tp_hit_indices = np.where(future_lows <= take_profit_price)[0]
+            sl_hit_indices = np.where(future_highs >= stop_loss_price)[0]
+
+            first_tp_hit = tp_hit_indices[0] if len(tp_hit_indices) > 0 else np.inf
+            first_sl_hit = sl_hit_indices[0] if len(sl_hit_indices) > 0 else np.inf
+
+            if first_tp_hit < first_sl_hit:
+                promising_short[i] = True
 
     return promising_long, promising_short
 
@@ -145,20 +245,29 @@ def generate_signals(df, params, base_signal_only=False):
     # --- Группировка по символу для корректного расчета индикаторов ---
     # Это критически важно, чтобы rolling-операции не "перетекали" между разными инструментами.
     if df['Symbol'].nunique() > 1:
-        # Если в DataFrame несколько символов, рекурсивно вызываем функцию для каждой группы
-        # и объединяем результаты.
         all_indices = []
-        all_indicators = {}
+        all_indicators_list = []
         all_used_params = set()
+        
+        # Сохраняем исходный индекс для восстановления после группировки
+        original_index = df.index
+        df_reset = df.reset_index(drop=True)
+
         for symbol, group_df in df.groupby('Symbol'):
-            indices, indicators, used_params = generate_signals(group_df, params, base_signal_only)
-            # TODO: Эта часть требует доработки для корректного объединения индикаторов.
-            # Пока что для множественных символов возвращаем только индексы.
-            all_indices.extend(indices)
+            # Передаем копию, чтобы избежать SettingWithCopyWarning
+            indices, indicators, used_params = generate_signals(group_df.copy(), params, base_signal_only)
+            
+            # Восстанавливаем исходные индексы для сигналов
+            original_group_indices = group_df.index
+            all_indices.extend(original_group_indices[indices])
+            
+            # Сохраняем индикаторы с их исходными индексами
+            all_indicators_list.append(pd.DataFrame(indicators, index=original_group_indices))
             all_used_params.update(used_params)
-        # ВНИМАНИЕ: Возврат индикаторов для нескольких символов пока не реализован полностью.
-        # Для текущей задачи (подсчет сигналов и симуляция) это не критично.
-        return all_indices, {}, all_used_params
+        
+        # Объединяем все DataFrame с индикаторами и сортируем по исходному индексу
+        combined_indicators_df = pd.concat(all_indicators_list).loc[original_index]
+        return sorted(all_indices), combined_indicators_df.to_dict('list'), all_used_params
 
     used_params = set()
     
@@ -249,37 +358,47 @@ def generate_signals(df, params, base_signal_only=False):
     # base_signal_only=True для "Вилки", поэтому эти блоки не выполнятся
     # Для ML-модели (когда base_signal_only=False) мы всегда рассчитываем эти индикаторы как признаки.
     if not base_signal_only:
-        used_params.update({"prints_analysis_period", "prints_threshold_ratio"})
-        long_sum = rolling_sum_numpy(df['long_prints'].values, prints_analysis_period)
-        short_sum = rolling_sum_numpy(df['short_prints'].values, prints_analysis_period)
-        # Prints Ratios
-        ratios = np.divide(long_sum, short_sum, where=short_sum > 0, out=np.full_like(long_sum, float('inf'), dtype=float))
-        prints_long = ratios > prints_threshold_ratio
-        prints_short = ratios < (1 / prints_threshold_ratio)
+        if 'long_prints' in df.columns and 'short_prints' in df.columns:
+            used_params.update({"prints_analysis_period", "prints_threshold_ratio"})
+            long_sum = rolling_sum_numpy(df['long_prints'].values, prints_analysis_period)
+            short_sum = rolling_sum_numpy(df['short_prints'].values, prints_analysis_period)
+            # Prints Ratios
+            ratios = np.divide(long_sum, short_sum, where=short_sum > 0, out=np.full_like(long_sum, float('inf'), dtype=float))
+            prints_long = ratios > prints_threshold_ratio
+            prints_short = ratios < (1 / prints_threshold_ratio)
 
         # M-Ratio
-        used_params.update({"m_analysis_period", "m_threshold_ratio"})
-        long_m_sum = rolling_sum_numpy(df['LongM'].values, m_analysis_period)
-        short_m_sum = rolling_sum_numpy(df['ShortM'].values, m_analysis_period)
-        m_ratios = np.divide(long_m_sum, short_m_sum, where=short_m_sum > 0, out=np.full_like(long_m_sum, float('inf'), dtype=float))
-        m_long = m_ratios > m_threshold_ratio
-        m_short = m_ratios < (1 / m_threshold_ratio)
+        if 'LongM' in df.columns and 'ShortM' in df.columns:
+            used_params.update({"m_analysis_period", "m_threshold_ratio"})
+            long_m_sum = rolling_sum_numpy(df['LongM'].values, m_analysis_period)
+            short_m_sum = rolling_sum_numpy(df['ShortM'].values, m_analysis_period)
+            m_ratios = np.divide(long_m_sum, short_m_sum, where=short_m_sum > 0, out=np.full_like(long_m_sum, float('inf'), dtype=float))
+            m_long = m_ratios > m_threshold_ratio
+            m_short = m_ratios < (1 / m_threshold_ratio)
 
     used_params.update({"hldir_window", "hldir_offset"})
 
     if hldir_mode == 'candle_compare':
-        # Новая логика на основе сравнения со свечой
-        hldir_values = df['HLdir'].values
-        cond1_long = (hldir_values == 1) & (high_prices > open_prices)
-        cond1_short = (hldir_values == 1) & (high_prices <= open_prices)
-        cond2_long = (hldir_values == 0) & (low_prices >= open_prices)
-        cond2_short = (hldir_values == 0) & (low_prices < open_prices)
-        hldir_long = cond1_long | cond2_long
-        hldir_short = cond1_short | cond2_short
+        if 'HLdir' in df.columns:
+            # Новая логика на основе сравнения со свечой
+            hldir_values = df['HLdir'].values
+            cond1_long = (hldir_values == 1) & (high_prices > open_prices)
+            cond1_short = (hldir_values == 1) & (high_prices <= open_prices)
+            cond2_long = (hldir_values == 0) & (low_prices >= open_prices)
+            cond2_short = (hldir_values == 0) & (low_prices < open_prices)
+            hldir_long = cond1_long | cond2_long
+            hldir_short = cond1_short | cond2_short
+        else:
+            hldir_long = np.zeros(len(df), dtype=bool)
+            hldir_short = np.zeros(len(df), dtype=bool)
     else: # 'rolling_mean' - логика по умолчанию
-        hldir_rolling_mean = pd.Series(df['HLdir']).rolling(window=hldir_window, min_periods=1).mean().shift(hldir_offset).values
-        hldir_long = hldir_rolling_mean > 0.5
-        hldir_short = hldir_rolling_mean <= 0.5
+        if 'HLdir' in df.columns:
+            hldir_rolling_mean = pd.Series(df['HLdir']).rolling(window=hldir_window, min_periods=1).mean().shift(hldir_offset).values
+            hldir_long = hldir_rolling_mean > 0.5
+            hldir_short = hldir_rolling_mean <= 0.5
+        else:
+            hldir_long = np.zeros(len(df), dtype=bool)
+            hldir_short = np.zeros(len(df), dtype=bool)
 
     # --- Конец расчета индикаторов для стратегий ---
 

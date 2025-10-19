@@ -310,10 +310,11 @@ class TradingSimulator:
                     # Если сигнал одобрен, сохраняем его признаки для отображения на графике
                     ml_features_for_trade = current_features.iloc[0].to_dict()
 
-            # Логика входа теперь всегда "Вилка отложенных ордеров"
-            base_price = close_prices[analysis_idx]
-            long_level = base_price * (1 + bracket_offset_pct / 100)
-            short_level = base_price * (1 - bracket_offset_pct / 100)
+            # --- ИСПРАВЛЕНИЕ: Базовая цена для "вилки" - это цена открытия СЛЕДУЮЩЕЙ свечи ---
+            # Это более реалистично, так как сигнал появляется после закрытия свечи `analysis_idx`.
+            base_price = open_prices[analysis_idx + 1]
+            long_level = base_price * (1 + bracket_offset_pct / 100) # type: ignore
+            short_level = base_price * (1 - bracket_offset_pct / 100) # type: ignore
 
             # Ищем вход в "вилке"
             entry_idx, entry_price, direction_str = find_bracket_entry(

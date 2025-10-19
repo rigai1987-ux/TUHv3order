@@ -370,8 +370,8 @@ def show_optimization_page():
                                 hover_data=pareto_df.columns,
                                 title="Компромисс между стабильностью (SQN), риском (Max Drawdown) и эффективностью сигналов"
                             )
-                            st.plotly_chart(fig, width='stretch')
-                        st.dataframe(top_10_df, width='stretch') # Отображаем таблицу для всех случаев
+                            st.plotly_chart(fig, use_container_width=True)
+                        st.dataframe(top_10_df, use_container_width=True) # Отображаем таблицу для всех случаев
 
                     # --- Новые графики для анализа оптимизации ---
                     study = final_results.get('study')
@@ -379,10 +379,10 @@ def show_optimization_page():
                         st.subheader("Анализ процесса оптимизации")
                         try:
                             fig_importance = optuna.visualization.plot_param_importances(study)
-                            st.plotly_chart(fig_importance, width='stretch')
+                            st.plotly_chart(fig_importance, use_container_width=True)
 
                             fig_history = optuna.visualization.plot_optimization_history(study)
-                            st.plotly_chart(fig_history, width='stretch')
+                            st.plotly_chart(fig_history, use_container_width=True)
                         except Exception as e:
                             st.warning(f"Не удалось построить графики анализа Optuna: {e}")
 
@@ -576,12 +576,12 @@ def show_optimization_page():
                 st.balloons()
                 summary_df = pd.DataFrame(wfo_results['summary'])
                 st.subheader("Результаты WFO")
-                st.dataframe(summary_df, width='stretch')
+                st.dataframe(summary_df, use_container_width=True)
                 st.subheader("Итоговые метрики (Out-of-Sample)")
                 st.json(wfo_results['aggregated_metrics'])
 
                 fig = visualizer.plot_wfo_results(summary_df, wfo_results['equity_curve'], wfo_results['aggregated_metrics'])
-                st.plotly_chart(fig, width='stretch')
+                st.plotly_chart(fig, use_container_width=True)
 
                 # --- Дополнительные графики для анализа WFO ---
                 st.subheader("Углубленный анализ WFO")
@@ -590,17 +590,17 @@ def show_optimization_page():
                 param_space = get_param_space_from_ui()
                 fig_params = visualizer.plot_wfo_parameter_stability(summary_df, param_space)
                 if fig_params:
-                    st.plotly_chart(fig_params, width='stretch')
+                    st.plotly_chart(fig_params, use_container_width=True)
 
                 # 2. График сравнения In-Sample vs Out-of-Sample
                 fig_is_oos = visualizer.plot_wfo_insample_vs_outsample(summary_df)
                 if fig_is_oos:
-                    st.plotly_chart(fig_is_oos, width='stretch')
+                    st.plotly_chart(fig_is_oos, use_container_width=True)
 
                 # 3. График важности признаков
                 fig_feat_imp = visualizer.plot_wfo_feature_importance(summary_df)
                 if fig_feat_imp:
-                    st.plotly_chart(fig_feat_imp, width='stretch')
+                    st.plotly_chart(fig_feat_imp, use_container_width=True)
 
                 # --- Конец блока дополнительных графиков ---
 
@@ -612,7 +612,7 @@ def show_optimization_page():
                     suggested_df = pd.DataFrame.from_dict(wfo_results['suggested_ranges'], orient='index')
                     suggested_df.reset_index(inplace=True)
                     suggested_df.columns = ['Параметр', 'Рекомендуемый min', 'Рекомендуемый max']
-                    st.dataframe(suggested_df, width='stretch')
+                    st.dataframe(suggested_df, use_container_width=True)
 
                     if st.button("✅ Применить предложенные диапазоны", key="apply_wfo_ranges"):
                         for _, row in suggested_df.iterrows():
@@ -725,7 +725,7 @@ def show_optimization_page():
                                 hover_data=['trial_number', 'total_pnl', 'win_rate', 'total_trades'],
                                 title="Компромисс между стабильностью (SQN) и риском (Max Drawdown)"
                             )
-                            st.plotly_chart(fig, width='stretch')
+                            st.plotly_chart(fig, use_container_width=True)
                         # Отображаем таблицу для всех случаев, когда есть top_10_results, а не только для многоцелевой
                         
                         # Улучшаем читаемость таблицы с параметрами классификаторов
@@ -733,15 +733,15 @@ def show_optimization_page():
                             cleaned_results = [optuna_optimizer._flatten_conditional_params(res.copy()) for res in opt_results['top_10_results']]
                             top_10_df = pd.DataFrame(cleaned_results)
 
-                        st.dataframe(top_10_df, width='stretch')
+                        st.dataframe(top_10_df, use_container_width=True)
 
                         # Добавляем графики анализа
                         study = opt_results.get('study')
                         if study:
                             st.subheader("Анализ процесса оптимизации")
                             fig_importance = optuna.visualization.plot_param_importances(study)
-                            st.plotly_chart(fig_importance, width='stretch')
-                        st.dataframe(top_10_df, width='stretch')
+                            st.plotly_chart(fig_importance, use_container_width=True)
+                        st.dataframe(top_10_df, use_container_width=True)
                 else:
                     st.error("Оптимизация завершилась, но не удалось найти ни одного подходящего набора параметров. Попробуйте расширить диапазоны оптимизации или проверить данные.")
                 
