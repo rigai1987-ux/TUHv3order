@@ -2,12 +2,6 @@ import pandas as pd
 import numpy as np
 from sklearn.preprocessing import StandardScaler
 from catboost import CatBoostClassifier
-import streamlit as st
-# Импортируем Numba-функции из симулятора для разметки
-from pykalman import KalmanFilter
-from hmmlearn.hmm import GaussianHMM
-from hurst import compute_Hc # Импортируем быструю функцию для расчета Хёрста
-from joblib import Parallel, delayed
 from trading_simulator import find_bracket_entry, find_first_exit
 
 def get_trade_outcome(
@@ -174,71 +168,6 @@ def generate_features(df: pd.DataFrame, params: dict) -> pd.DataFrame:
     if 'datetime' in df_copy.columns:
         df_copy['hour_of_day'] = df_copy['datetime'].dt.hour
 
-    # 4. Фильтр Калмана
-    kalman_period = params.get('ml_kalman_period', 20)
-    if kalman_period > 0 and len(df_copy) > kalman_period:
-        kf = KalmanFilter(transition_matrices=[1],
-                          observation_matrices=[1],
-                          initial_state_mean=0,
-                          initial_state_covariance=1,
-                          observation_covariance=1,
-                          transition_covariance=0.01)
-        state_means, _ = kf.filter(df_copy['close'].values)
-        df_copy['kalman_price'] = state_means.flatten()
-        # Наклон линии Калмана
-        df_copy['kalman_slope'] = df_copy['kalman_price'].diff()
-
-    # 5. Скрытая Марковская Модель (HMM)
-    # --- МАКСИМАЛЬНОЕ УСКОРЕНИЕ: Распараллеливаем обучение HMM на все ядра CPU ---
-    hmm_components = params.get('ml_hmm_components', 3)
-    hmm_period = params.get('ml_hmm_period', 60)
-    hmm_train_window = params.get('ml_hmm_train_window', 252) # Новое: окно для обучения HMM
-    if hmm_components > 1 and hmm_period > 0 and len(df_copy) > hmm_train_window:
-        returns = df_copy['close'].pct_change().fillna(0)
-        volatility = returns.rolling(window=hmm_period).std().fillna(0)
-        hmm_features = np.column_stack([returns.values, volatility.values])
-
-        def get_hmm_state(i):
-            """Обучает HMM на окне и предсказывает состояние для последней точки."""
-            if i < hmm_train_window:
-                return 0
-            train_data = hmm_features[i-hmm_train_window:i]
-            # Проверка на валидность данных перед обучением
-            if np.any(np.isinf(train_data)) or np.any(np.isnan(train_data)):
-                return 0 # Возвращаем дефолтное состояние
-            try:
-                model = GaussianHMM(n_components=hmm_components, covariance_type="diag", n_iter=100, random_state=42)
-                model.fit(train_data)
-                return model.predict(hmm_features[i-1:i])[0]
-            except ValueError: # Может возникнуть, если данные в окне вырождаются
-                return 0
-
-        # Запускаем вычисления параллельно на всех доступных ядрах (-1)
-        # 'loky' - более надежный бэкенд для сложных библиотек типа numpy/pandas
-        states = Parallel(n_jobs=-1, backend='loky')(delayed(get_hmm_state)(i) for i in range(len(df_copy)))
-        df_copy['hmm_state'] = np.array(states)
-
-    # 6. Экспонента Хёрста
-    # --- МАКСИМАЛЬНОЕ УСКОРЕНИЕ: Распараллеливаем расчет Хёрста на все ядра CPU ---
-    hurst_period = params.get('ml_hurst_period', 100)
-    if hurst_period > 0 and len(df_copy) > hurst_period:
-        close_prices = df_copy['close'].values
-
-        def get_hurst_value(i):
-            """Считает Хёрста для одного окна."""
-            if i < hurst_period:
-                return 0.5 # Нейтральное значение по умолчанию
-            series = close_prices[i-hurst_period:i]
-            # compute_Hc может выбросить исключение на вырожденных данных
-            try:
-                H, _, _ = compute_Hc(series, kind='price', simplified=True)
-                return H
-            except (ValueError, FloatingPointError):
-                return 0.5 # Возвращаем нейтральное значение в случае ошибки
-
-        hurst_values = Parallel(n_jobs=-1, backend='loky')(delayed(get_hurst_value)(i) for i in range(len(df_copy)))
-        df_copy['hurst'] = np.array(hurst_values)
-
     return df_copy.fillna(0) # Заполняем возможные NaN нулями
 
 def train_ml_model(X: pd.DataFrame, y: pd.Series, ml_params: dict):
@@ -257,8 +186,7 @@ def train_ml_model(X: pd.DataFrame, y: pd.Series, ml_params: dict):
     feature_names = [
         'prints_strength', 'market_strength', 'hldir_strength',
         'relative_body_size', 'upper_wick_ratio',
-        'hour_of_day', 'hmm_state', # Категориальные
-        'kalman_slope', 'hurst', # Новые числовые
+        'hour_of_day',
         'natr', 'growth_pct' # Добавляем базовые индикаторы как признаки
     ]
     
@@ -266,7 +194,7 @@ def train_ml_model(X: pd.DataFrame, y: pd.Series, ml_params: dict):
     available_features = [f for f in feature_names if f in X.columns]
     X_train = X[available_features]
     # Определяем категориальные и числовые признаки
-    categorical_features = [col for col in ['hour_of_day', 'hmm_state'] if col in X_train.columns]
+    categorical_features = [col for col in ['hour_of_day'] if col in X_train.columns]
     numerical_features = [col for col in available_features if col not in categorical_features]
     
     # Масштабирование числовых признаков
@@ -295,16 +223,13 @@ def train_ml_model(X: pd.DataFrame, y: pd.Series, ml_params: dict):
     # --- НОВЫЙ БЛОК: Создание словаря с описаниями признаков ---
     prints_window = ml_params.get('ml_prints_window', 10)
     feature_descriptions = {
-        # --- ИЗМЕНЕНИЕ: Добавляем описания для новых признаков ---
+        # --- ИСПРАВЛЕНИЕ: Используем f-string для динамического отображения периода ---
         'prints_strength': f"**Сила принтов (окно {prints_window})**: Суммарная разница между 'длинными' и 'короткими' принтами.",
         'market_strength': f"**Сила рынка (окно {prints_window})**: Суммарная разница между рыночными покупками и продажами.",
         'hldir_strength': f"**Сила направления свечи (окно {prints_window})**: Среднее значение `HLdir` (положение закрытия относительно high/low).",
         'relative_body_size': "**Относительный размер тела**: Отношение размера тела свечи к её общему диапазону. Формула: `abs(close - open) / (high - low)`",
         'upper_wick_ratio': "**Отношение верхней тени**: Отношение верхней тени к общему диапазону свечи. Формула: `(high - max(open, close)) / (high - low)`",
         'hour_of_day': "**Час дня**: Час, в который сформировался сигнал (0-23). Категориальный признак.",
-        'kalman_slope': f"**Наклон Калмана**: Наклон сглаженной фильтром Калмана линии цены. Показывает локальный микро-тренд.",
-        'hmm_state': f"**Состояние HMM (окно {ml_params.get('ml_hmm_period', 60)})**: Скрытое состояние рынка (режим), определенное Скрытой Марковской Моделью. Категориальный признак.",
-        'hurst': f"**Экспонента Хёрста (окно {ml_params.get('ml_hurst_period', 100)})**: Показывает 'память' рынка. > 0.5 = тренд, < 0.5 = возврат к среднему.",
         'natr': "**Нормализованный ATR**: Индикатор волатильности NATR. Показывает средний диапазон свечи в процентах от цены.",
         'growth_pct': "**Процент роста**: Рост цены за `lookback_period` свечей. Показывает недавний импульс."
     }

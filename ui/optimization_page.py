@@ -218,6 +218,7 @@ def show_optimization_page():
                     max_key = f"{param_name}_max_optimization"
                     st.number_input(f"{param_name} (max)", key=max_key, value=st.session_state.get(max_key, min_value_arg * 2), step=step, min_value=min_value_arg)
 
+
         col1, col2 = st.columns(2)
         with col1:
             optuna_trials = st.number_input("Количество проб Optuna", value=50, min_value=10, step=10, key="optuna_trials")

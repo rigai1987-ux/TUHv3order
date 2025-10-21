@@ -6,5 +6,4 @@ optuna
 scikit-learn
 numba
 catboost
-joblib
 pyarrow
