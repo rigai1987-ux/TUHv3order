@@ -1,144 +1,332 @@
-import numpy as np
 import pandas as pd
-import hashlib
+import numpy as np
 from sklearn.preprocessing import StandardScaler
+from catboost import CatBoostClassifier
+import streamlit as st
+# Импортируем Numba-функции из симулятора для разметки
+from pykalman import KalmanFilter
+from hmmlearn.hmm import GaussianHMM
+from hurst import compute_Hc # Импортируем быструю функцию для расчета Хёрста
+from joblib import Parallel, delayed
+from trading_simulator import find_bracket_entry, find_first_exit
 
-from signal_generator import generate_signals, find_future_outcomes
-
-import logging
-try:
-    from catboost import CatBoostClassifier
-    CATBOOST_AVAILABLE = True
-except ImportError:
-    CatBoostClassifier = None
-    CATBOOST_AVAILABLE = False
-
-CLASSIFIER_MAPPING = {}
-if CATBOOST_AVAILABLE:
-    CLASSIFIER_MAPPING["CatBoost"] = CatBoostClassifier
-
-# --- Глобальный кэш для ускорения повторных вычислений в Optuna/WFO ---
-# Ключ - хэш от параметров, Значение - (DataFrame с признаками, целевая переменная)
-ML_DATA_CACHE = {}
-
-def train_ml_model(df: pd.DataFrame, params: dict, signal_indices: list):
+def get_trade_outcome(
+    signal_idx: int,
+    params: dict,
+    open_prices: np.ndarray,
+    high_prices: np.ndarray,
+    low_prices: np.ndarray,
+    close_prices: np.ndarray,
+    hldir_values: np.ndarray
+) -> int:
     """
-    Полный цикл обучения ML-модели: генерация признаков, кэширование, обучение.
+    Определяет исход одного сигнала (TP, SL или нет входа) для разметки.
+    Эта функция полностью имитирует логику симулятора для одного сигнала.
 
     Args:
-        df (pd.DataFrame): DataFrame с рыночными данными.
-        params (dict): Словарь с параметрами стратегии и модели.
-        signal_indices (list): Индексы базовых сигналов для обучения.
+        signal_idx: Индекс сигнальной свечи.
+        params: Словарь с параметрами.
+        ... массивы цен ...
 
     Returns:
-        dict: Словарь с результатами обучения:
-              'model', 'scaler', 'feature_df', 'feature_importances', 'used_params'.
-              В случае неудачи 'model' будет None, а 'failure_reason' будет содержать причину.
+        1: если сделка закрылась по Take Profit.
+        0: если сделка закрылась по Stop Loss или по таймауту разметки.
+        -1: если входа в сделку не произошло.
     """
-    classifier_type = params.get("classifier_type")
-    if not (classifier_type and classifier_type in CLASSIFIER_MAPPING):
-        return {
-            'model': None, 'scaler': None, 'feature_df': None, 
-            'feature_importances': None, 'used_params': set(),
-            'failure_reason': "Тип классификатора не указан или не поддерживается."
-        }
+    # --- 1. Получаем параметры, идентичные симулятору ---
+    bracket_offset_pct = params.get("bracket_offset_pct", 0.5)
+    bracket_timeout_candles = params.get("bracket_timeout_candles", 5)
+    stop_loss_pct = params.get('stop_loss_pct', 2.0)
+    take_profit_pct = params.get('take_profit_pct', 4.0)
+    labeling_timeout = params.get('ml_labeling_timeout_candles', 20)
+    use_hldir_on_conflict = params.get("use_hldir_on_conflict", True)
+    simulate_slippage = params.get("simulate_slippage", True)
 
-    used_params = set()
+    # --- 2. Ищем вход в сделку (логика идентична trading_simulator.py) ---
+    base_price = open_prices[signal_idx + 1]
+    long_level = base_price * (1 + bracket_offset_pct / 100)
+    short_level = base_price * (1 - bracket_offset_pct / 100)
 
-    # --- Оптимизация: Кэширование генерации признаков и целей ---
-    # 1. Создаем уникальный ключ для кэширования
-    ml_param_keys = [
-        'vol_period', 'vol_pctl', 'range_period', 'rng_pctl', 'natr_period', 'natr_min',
-        'lookback_period', 'min_growth_pct', 'stop_loss_pct', 'take_profit_pct', 'bracket_timeout_candles',
-        'hldir_window', 'hldir_offset', 'prints_analysis_period', 'prints_threshold_ratio',
-        'm_analysis_period', 'm_threshold_ratio'
-    ]
-    relevant_params = {k: params.get(k) for k in ml_param_keys if k in params}
-    params_str = str(sorted(relevant_params.items()))
-    df_hash = hashlib.sha256(pd.util.hash_pandas_object(df, index=True).values).hexdigest()
-    cache_key = f"{df_hash}_{params_str}"
+    entry_idx, entry_price, direction_str = find_bracket_entry(
+        start_idx=signal_idx + 1,
+        timeout=bracket_timeout_candles,
+        long_level=long_level,
+        short_level=short_level,
+        use_hldir_on_conflict=use_hldir_on_conflict,
+        simulate_slippage=simulate_slippage,
+        hldir_values=hldir_values,
+        high_prices=high_prices,
+        low_prices=low_prices,
+        open_prices=open_prices
+    )
 
-    # 2. Проверяем кэш
-    if cache_key in ML_DATA_CACHE:
-        feature_df, target, ml_feature_gen_used_params = ML_DATA_CACHE[cache_key]
-        used_params.update(ml_feature_gen_used_params)
+    if direction_str == "none":
+        return -1 # Входа не было
+
+    # --- 3. Ищем выход из сделки (логика идентична trading_simulator.py) ---
+    direction_is_long = (direction_str == 'long')
+    stop_loss_price = entry_price * (1 - stop_loss_pct / 100) if direction_is_long else entry_price * (1 + stop_loss_pct / 100)
+    take_profit_price = entry_price * (1 + take_profit_pct / 100) if direction_is_long else entry_price * (1 - take_profit_pct / 100)
+
+    exit_idx, exit_reason, _ = find_first_exit(
+        entry_idx=entry_idx,
+        direction_is_long=direction_is_long,
+        stop_loss=stop_loss_price,
+        take_profit=take_profit_price,
+        high_prices=high_prices, low_prices=low_prices, close_prices=close_prices
+    )
+
+    # --- 4. Определяем метку на основе исхода ---
+    if exit_idx > entry_idx and exit_idx < entry_idx + labeling_timeout:
+        return 1 if exit_reason == 'take_profit' else 0
     else:
-        # Если в кэше нет, выполняем дорогостоящие вычисления
-        # 1. Подготовка признаков (X)
-        _, all_indicators, ml_feature_gen_used_params = generate_signals(df, params, base_signal_only=False)
-        used_params.update(ml_feature_gen_used_params)
-        
-        feature_df = pd.DataFrame(all_indicators)
-        feature_df['price_range'] = df['high'] - df['low']
-        feature_df['volume'] = df['volume']
-        feature_df.fillna(0, inplace=True)
-        feature_df.replace([np.inf, -np.inf], 0, inplace=True)
+        # Если выход произошел за пределами окна разметки или в конце данных, считаем это неудачей
+        return 0
 
-        # 2. Определяем целевую переменную (y)
-        profit_target_for_labeling = params.get("take_profit_pct", 4.0)
-        loss_limit_for_labeling = params.get("stop_loss_pct", 2.0)
-        # Горизонт разметки должен быть достаточно большим
-        look_forward_for_labeling = params.get("bracket_timeout_candles", 5) * 5 
-        bracket_offset_for_labeling = params.get("bracket_offset_pct", 0.5)
+def label_all_signals(df_with_features: pd.DataFrame, signal_indices: list, params: dict) -> tuple[pd.DataFrame, pd.Series]:
+    """
+    Размечает ВСЕ СИГНАЛЫ на "успешные" (1) и "провальные" (0) для обучения ML-модели.
+    Для каждого сигнала выполняется микро-симуляция, чтобы определить его исход.
 
-        promising_long, _ = find_future_outcomes(
-            df['close'].values, df['high'].values, df['low'].values, df['open'].values,
-            look_forward_period=look_forward_for_labeling,
-            profit_target_ratio=profit_target_for_labeling / 100,
-            loss_limit_ratio=loss_limit_for_labeling / 100,
-            bracket_offset_ratio=bracket_offset_for_labeling / 100,
-            bracket_timeout_candles=params.get("bracket_timeout_candles", 5)
+    Args:
+        df_with_features (pd.DataFrame): DataFrame с рассчитанными признаками.
+        signal_indices (list): Список индексов свечей, на которых сгенерированы сигналы.
+        params (dict): Словарь с параметрами стратегии и разметки.
+
+    Returns:
+        tuple[pd.DataFrame, pd.Series]: Кортеж, содержащий:
+            - X (pd.DataFrame): DataFrame с признаками для обучения.
+            - y (pd.Series): Series с целевыми метками (0 или 1).
+    """
+    # Получаем только один параметр, нужный для проверки границ данных
+    labeling_timeout = params.get('ml_labeling_timeout_candles', 20)
+
+    labels = []
+    valid_signal_indices = []
+
+    # Извлекаем массивы numpy для Numba
+    open_prices = df_with_features['open'].values
+    high_prices = df_with_features['high'].values
+    low_prices = df_with_features['low'].values
+    close_prices = df_with_features['close'].values
+    hldir_values = df_with_features['HLdir'].values if 'HLdir' in df_with_features.columns else np.zeros_like(open_prices)
+
+    for signal_idx in signal_indices:
+        # Пропускаем сигналы слишком близко к концу данных
+        # Нужен запас свечей для таймаута входа и таймаута разметки
+        if signal_idx + params.get("bracket_timeout_candles", 5) + labeling_timeout >= len(df_with_features):
+            continue
+
+        # --- ИСПОЛЬЗУЕМ УНИФИЦИРОВАННУЮ ФУНКЦИЮ ---
+        outcome = get_trade_outcome(
+            signal_idx, params, open_prices, high_prices, low_prices, close_prices, hldir_values
         )
-        target = np.zeros(len(df))
-        target[promising_long] = 1
 
-        # 3. Сохраняем результат в кэш (без scaler)
-        ML_DATA_CACHE[cache_key] = (feature_df, target, ml_feature_gen_used_params)
+        # Если outcome == -1 (входа не было), мы просто пропускаем этот сигнал,
+        # так как он не несет информации для обучения.
+        if outcome == -1:
+            continue
+        
+        labels.append(outcome) # outcome здесь может быть только 0 или 1
+        valid_signal_indices.append(signal_idx)
 
-    # --- Подготовка данных и обучение модели ---
-    used_params.add("classifier_type")
-    X = feature_df.loc[signal_indices]
-    y = target[signal_indices]
+    if not valid_signal_indices:
+        return pd.DataFrame(), pd.Series(dtype='int')
 
-    model = None
-    feature_importances = None
-    failure_reason = None
+    # --- ИСПРАВЛЕНИЕ: Используем .iloc для доступа по целочисленным позициям ---
+    # valid_signal_indices - это список позиций (row numbers), а не меток индекса.
+    # .iloc гарантирует, что мы выберем правильные строки по их порядковому номеру.
+    X = df_with_features.iloc[valid_signal_indices]
+    y = pd.Series(labels, index=valid_signal_indices)
 
-    if len(X) <= 10:
-        logging.warning(f"[ML Handler] Недостаточно сигналов для обучения (требуется > 10, найдено: {len(X)}).")
-        failure_reason = f"Недостаточно сигналов для обучения (требуется > 10, найдено: {len(X)})."
-    elif len(np.unique(y)) <= 1:
-        unique_class = np.unique(y)[0] if len(np.unique(y)) > 0 else 'N/A'
-        logging.warning(f"[ML Handler] Все {len(y)} сигналов относятся к одному классу ({unique_class}). Модель не будет обучаться.")
-        failure_reason = (f"Все сигналы ({len(y)}) относятся к одному классу. "
-                          "Модели не на чем учиться. Попробуйте изменить параметры разметки "
-                          "(SL/TP, горизонт скрининга) или базовые фильтры стратегии.")
-    else:
-        # --- ИСПРАВЛЕНИЕ: Scaler создается и обучается здесь, на актуальных данных ---
-        scaler = StandardScaler()
-        logging.info(f"[ML Handler] Обучение Scaler и модели '{classifier_type}' на {len(X)} сигналах.")
-        X_scaled = scaler.fit_transform(X) # Используем fit_transform
+    return X, y
 
-        logging.info(f"[ML Handler] Запуск обучения модели '{classifier_type}' на {len(X)} сигналах.")
-        model_class = CLASSIFIER_MAPPING[classifier_type] # type: ignore
-        model_init_params = {k.replace(classifier_type.lower() + '_', ''): v for k, v in params.items() if k.startswith(classifier_type.lower() + '_')}
-        used_params.update([k for k in params.keys() if k.startswith(classifier_type.lower() + '_')])
+def generate_features(df: pd.DataFrame, params: dict) -> pd.DataFrame:
+    """
+    Обогащает DataFrame дополнительными признаками для ML-модели.
 
-        try:
-            model = model_class(**model_init_params, random_state=42, verbose=0)
-            model.fit(X_scaled, y)
-            if hasattr(model, 'get_feature_importance'):
-                importances = model.get_feature_importance()
-                feature_names = X.columns.tolist()
-                feature_importances = dict(zip(feature_names, importances))
-                logging.info("[ML Handler] Модель успешно обучена.")
-        except Exception as e: # type: ignore
-            failure_reason = f"Внутренняя ошибка классификатора '{classifier_type}': {e}"            
-            model = None
-            feature_importances = None
+    Args:
+        df (pd.DataFrame): Исходный DataFrame с индикаторами.
+        params (dict): Словарь с параметрами.
 
-    return {
-        'model': model, 'scaler': scaler, 'feature_df': feature_df,
-        'feature_importances': feature_importances, 'used_params': used_params,
-        'failure_reason': failure_reason
+    Returns:
+        pd.DataFrame: DataFrame с добавленными ML-признаками.
+    """
+    df_copy = df.copy()
+
+    # 1. Признаки на основе принтов и рыночной силы (пример, требует адаптации)
+    # Эти расчеты предполагают, что у вас есть столбцы 'long_prints', 'short_prints', 'LongM', 'ShortM'
+    # Если их нет, эти строки нужно закомментировать или адаптировать.
+    prints_window = params.get('ml_prints_window', 10)
+    df_copy['prints_strength'] = (df_copy['long_prints'].rolling(window=prints_window).sum() - 
+                                  df_copy['short_prints'].rolling(window=prints_window).sum())
+    df_copy['market_strength'] = (df_copy['LongM'].rolling(window=prints_window).sum() - 
+                                  df_copy['ShortM'].rolling(window=prints_window).sum())
+
+    # 2. Признаки на основе свечей
+    df_copy['hldir_strength'] = df_copy['HLdir'].rolling(window=prints_window).mean()
+    body_size = abs(df_copy['close'] - df_copy['open'])
+    candle_range = df_copy['high'] - df_copy['low']
+    df_copy['relative_body_size'] = body_size / candle_range.replace(0, np.nan)
+    df_copy['upper_wick_ratio'] = (df_copy['high'] - np.maximum(df_copy['open'], df_copy['close'])) / candle_range.replace(0, np.nan)
+
+    # 3. Временные признаки
+    if 'datetime' in df_copy.columns:
+        df_copy['hour_of_day'] = df_copy['datetime'].dt.hour
+
+    # 4. Фильтр Калмана
+    kalman_period = params.get('ml_kalman_period', 20)
+    if kalman_period > 0 and len(df_copy) > kalman_period:
+        kf = KalmanFilter(transition_matrices=[1],
+                          observation_matrices=[1],
+                          initial_state_mean=0,
+                          initial_state_covariance=1,
+                          observation_covariance=1,
+                          transition_covariance=0.01)
+        state_means, _ = kf.filter(df_copy['close'].values)
+        df_copy['kalman_price'] = state_means.flatten()
+        # Наклон линии Калмана
+        df_copy['kalman_slope'] = df_copy['kalman_price'].diff()
+
+    # 5. Скрытая Марковская Модель (HMM)
+    # --- МАКСИМАЛЬНОЕ УСКОРЕНИЕ: Распараллеливаем обучение HMM на все ядра CPU ---
+    hmm_components = params.get('ml_hmm_components', 3)
+    hmm_period = params.get('ml_hmm_period', 60)
+    hmm_train_window = params.get('ml_hmm_train_window', 252) # Новое: окно для обучения HMM
+    if hmm_components > 1 and hmm_period > 0 and len(df_copy) > hmm_train_window:
+        returns = df_copy['close'].pct_change().fillna(0)
+        volatility = returns.rolling(window=hmm_period).std().fillna(0)
+        hmm_features = np.column_stack([returns.values, volatility.values])
+
+        def get_hmm_state(i):
+            """Обучает HMM на окне и предсказывает состояние для последней точки."""
+            if i < hmm_train_window:
+                return 0
+            train_data = hmm_features[i-hmm_train_window:i]
+            # Проверка на валидность данных перед обучением
+            if np.any(np.isinf(train_data)) or np.any(np.isnan(train_data)):
+                return 0 # Возвращаем дефолтное состояние
+            try:
+                model = GaussianHMM(n_components=hmm_components, covariance_type="diag", n_iter=100, random_state=42)
+                model.fit(train_data)
+                return model.predict(hmm_features[i-1:i])[0]
+            except ValueError: # Может возникнуть, если данные в окне вырождаются
+                return 0
+
+        # Запускаем вычисления параллельно на всех доступных ядрах (-1)
+        # 'loky' - более надежный бэкенд для сложных библиотек типа numpy/pandas
+        states = Parallel(n_jobs=-1, backend='loky')(delayed(get_hmm_state)(i) for i in range(len(df_copy)))
+        df_copy['hmm_state'] = np.array(states)
+
+    # 6. Экспонента Хёрста
+    # --- МАКСИМАЛЬНОЕ УСКОРЕНИЕ: Распараллеливаем расчет Хёрста на все ядра CPU ---
+    hurst_period = params.get('ml_hurst_period', 100)
+    if hurst_period > 0 and len(df_copy) > hurst_period:
+        close_prices = df_copy['close'].values
+
+        def get_hurst_value(i):
+            """Считает Хёрста для одного окна."""
+            if i < hurst_period:
+                return 0.5 # Нейтральное значение по умолчанию
+            series = close_prices[i-hurst_period:i]
+            # compute_Hc может выбросить исключение на вырожденных данных
+            try:
+                H, _, _ = compute_Hc(series, kind='price', simplified=True)
+                return H
+            except (ValueError, FloatingPointError):
+                return 0.5 # Возвращаем нейтральное значение в случае ошибки
+
+        hurst_values = Parallel(n_jobs=-1, backend='loky')(delayed(get_hurst_value)(i) for i in range(len(df_copy)))
+        df_copy['hurst'] = np.array(hurst_values)
+
+    return df_copy.fillna(0) # Заполняем возможные NaN нулями
+
+def train_ml_model(X: pd.DataFrame, y: pd.Series, ml_params: dict):
+    """
+    Обучает модель CatBoostClassifier на предоставленных данных.
+    
+    Args:
+        X (pd.DataFrame): DataFrame с признаками.
+        y (pd.Series): Series с метками (0 или 1).
+        ml_params (dict): Словарь с гиперпараметрами для CatBoost.
+
+    Returns:
+        dict: Словарь, содержащий обученную модель, скейлер, имена признаков и их важность.
+    """
+    # Определяем список всех признаков, которые будут использоваться
+    feature_names = [
+        'prints_strength', 'market_strength', 'hldir_strength',
+        'relative_body_size', 'upper_wick_ratio',
+        'hour_of_day', 'hmm_state', # Категориальные
+        'kalman_slope', 'hurst', # Новые числовые
+        'natr', 'growth_pct' # Добавляем базовые индикаторы как признаки
+    ]
+    
+    # Отбираем только те признаки, которые есть в DataFrame X
+    available_features = [f for f in feature_names if f in X.columns]
+    X_train = X[available_features]
+    # Определяем категориальные и числовые признаки
+    categorical_features = [col for col in ['hour_of_day', 'hmm_state'] if col in X_train.columns]
+    numerical_features = [col for col in available_features if col not in categorical_features]
+    
+    # Масштабирование числовых признаков
+    scaler = StandardScaler()
+    X_train_scaled = X_train.copy()
+    if numerical_features:
+        # Масштабируем только числовые признаки
+        X_train_scaled[numerical_features] = scaler.fit_transform(X_train[numerical_features])
+
+    # CatBoost ожидает, что категориальные признаки будут в исходном виде (немасштабированные)
+    # Поэтому мы передаем DataFrame, где только числовые признаки были масштабированы.
+    # Инициализация и обучение модели
+    model = CatBoostClassifier(
+        iterations=ml_params.get('ml_iterations', 300),
+        depth=ml_params.get('ml_depth', 4),
+        learning_rate=ml_params.get('ml_learning_rate', 0.1),
+        verbose=0,  # Отключаем логирование обучения в консоль
+        random_seed=42,
+        cat_features=categorical_features
+    )
+
+    # Убираем st.spinner, так как эта функция может вызываться из фонового потока Optuna,
+    # что приводит к ошибке "missing ScriptRunContext".
+    model.fit(X_train_scaled, y)
+
+    # --- НОВЫЙ БЛОК: Создание словаря с описаниями признаков ---
+    prints_window = ml_params.get('ml_prints_window', 10)
+    feature_descriptions = {
+        # --- ИЗМЕНЕНИЕ: Добавляем описания для новых признаков ---
+        'prints_strength': f"**Сила принтов (окно {prints_window})**: Суммарная разница между 'длинными' и 'короткими' принтами.",
+        'market_strength': f"**Сила рынка (окно {prints_window})**: Суммарная разница между рыночными покупками и продажами.",
+        'hldir_strength': f"**Сила направления свечи (окно {prints_window})**: Среднее значение `HLdir` (положение закрытия относительно high/low).",
+        'relative_body_size': "**Относительный размер тела**: Отношение размера тела свечи к её общему диапазону. Формула: `abs(close - open) / (high - low)`",
+        'upper_wick_ratio': "**Отношение верхней тени**: Отношение верхней тени к общему диапазону свечи. Формула: `(high - max(open, close)) / (high - low)`",
+        'hour_of_day': "**Час дня**: Час, в который сформировался сигнал (0-23). Категориальный признак.",
+        'kalman_slope': f"**Наклон Калмана**: Наклон сглаженной фильтром Калмана линии цены. Показывает локальный микро-тренд.",
+        'hmm_state': f"**Состояние HMM (окно {ml_params.get('ml_hmm_period', 60)})**: Скрытое состояние рынка (режим), определенное Скрытой Марковской Моделью. Категориальный признак.",
+        'hurst': f"**Экспонента Хёрста (окно {ml_params.get('ml_hurst_period', 100)})**: Показывает 'память' рынка. > 0.5 = тренд, < 0.5 = возврат к среднему.",
+        'natr': "**Нормализованный ATR**: Индикатор волатильности NATR. Показывает средний диапазон свечи в процентах от цены.",
+        'growth_pct': "**Процент роста**: Рост цены за `lookback_period` свечей. Показывает недавний импульс."
     }
+    # --- Конец нового блока ---
+
+    # Получаем важность признаков
+    feature_importances = pd.DataFrame({
+        'feature': available_features,
+        'importance': model.get_feature_importance()
+    }).sort_values('importance', ascending=False)
+
+    # --- НОВОЕ: Добавляем столбец с описаниями ---
+    feature_importances['description'] = feature_importances['feature'].map(feature_descriptions)
+    
+    # Возвращаем "бандл" с моделью и всем необходимым для предсказаний
+    model_bundle = {
+        "model": model,
+        "scaler": scaler,
+        "feature_names": available_features,
+        "numerical_features": numerical_features,
+        "categorical_features": categorical_features, # Добавляем информацию о категориальных признаках
+        "feature_importances": feature_importances,
+    }
+    
+    return model_bundle

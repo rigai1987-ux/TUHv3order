@@ -31,32 +31,12 @@ def get_param_space_from_ui():
         "min_growth_pct": ("float", "min_growth_pct_min_optimization", "min_growth_pct_max_optimization"),
         "stop_loss_pct": ("float", "stop_loss_pct_min_optimization", "stop_loss_pct_max_optimization"),
         "take_profit_pct": ("float", "take_profit_pct_min_optimization", "take_profit_pct_max_optimization"),
+        "ml_iterations": ("int", "ml_iterations_min_optimization", "ml_iterations_max_optimization"),
+        "ml_depth": ("int", "ml_depth_min_optimization", "ml_depth_max_optimization"),
+        "ml_learning_rate": ("float", "ml_learning_rate_min_optimization", "ml_learning_rate_max_optimization"),
+        "ml_prints_window": ("int", "ml_prints_window_min_optimization", "ml_prints_window_max_optimization"),
+        "ml_labeling_timeout_candles": ("int", "ml_labeling_timeout_candles_min_optimization", "ml_labeling_timeout_candles_max_optimization"),
     }
-
-    # --- Новая логика для добавления классификаторов ---
-    classifier_choices = st.session_state.get("classifier_choices", [])
-    if classifier_choices:
-        param_space['classifier_type'] = ('categorical', classifier_choices)
-
-        # Определяем условные параметры для каждого классификатора
-        conditional_params = {}
-        if "CatBoost" in classifier_choices:
-            conditional_params["CatBoost"] = {
-                'catboost_iterations': ('int', st.session_state.get("catboost_iterations_min", 50), st.session_state.get("catboost_iterations_max", 300)),
-                'catboost_depth': ('int', st.session_state.get("catboost_depth_min", 4), st.session_state.get("catboost_depth_max", 8)),
-                'catboost_learning_rate': ('float', st.session_state.get("catboost_learning_rate_min", 0.01), st.session_state.get("catboost_learning_rate_max", 0.2)),
-            }
-        
-        # Добавляем параметры признаков, которые используются только с ML
-        if "CatBoost" in classifier_choices:
-            param_space['prints_analysis_period'] = ('int', st.session_state.get("prints_analysis_period_min", 2), st.session_state.get("prints_analysis_period_max", 10))
-            param_space['prints_threshold_ratio'] = ('float', st.session_state.get("prints_threshold_ratio_min", 1.1), st.session_state.get("prints_threshold_ratio_max", 3.0))
-            param_space['m_analysis_period'] = ('int', st.session_state.get("m_analysis_period_min", 2), st.session_state.get("m_analysis_period_max", 10))
-            param_space['m_threshold_ratio'] = ('float', st.session_state.get("m_threshold_ratio_min", 1.1), st.session_state.get("m_threshold_ratio_max", 3.0))
-            param_space['hldir_window'] = ('int', st.session_state.get("hldir_window_min", 5), st.session_state.get("hldir_window_max", 20))
-            param_space['hldir_offset'] = ('int', st.session_state.get("hldir_offset_min_optimization", 0), st.session_state.get("hldir_offset_max_optimization", 10))
-
-        param_space['classifier_params'] = ('conditional', 'classifier_type', conditional_params)
 
     # entry_logic_mode = st.session_state.get("entry_logic_mode_optimization", "Принты и HLdir") # Логика входа теперь одна
     for name, (ptype, min_key, max_key) in param_definitions.items():
@@ -66,24 +46,60 @@ def get_param_space_from_ui():
             param_space[name] = (ptype, min_val, max_val)
 
     # Обработка логики входа
-    param_space["entry_logic_mode"] = ("categorical", ["Вилка отложенных ордеров"])
 
     # Обработка параметров "вилки"
     param_space["bracket_offset_pct"] = ("float", st.session_state.get("bracket_offset_pct_min_optimization"), st.session_state.get("bracket_offset_pct_max_optimization"))
     param_space["bracket_timeout_candles"] = ("int", st.session_state.get("bracket_timeout_candles_min_optimization"), st.session_state.get("bracket_timeout_candles_max_optimization"))
 
-    # Обработка климаксного выхода
-    use_climax_exit_option = st.session_state.get("use_climax_exit_option", "Нет")
-    if use_climax_exit_option == "Да":
-        param_space["use_climax_exit"] = ("categorical", [True])
-        param_space["climax_exit_window"] = ("int", st.session_state.get("climax_exit_window_min_optimization"), st.session_state.get("climax_exit_window_max_optimization"))
-        param_space["climax_exit_threshold"] = ("float", st.session_state.get("climax_exit_threshold_min_optimization"), st.session_state.get("climax_exit_threshold_max_optimization"))
-    else:
-        param_space["use_climax_exit"] = ("categorical", [False], None)
-
     # Удаляем None значения, если виджеты не были созданы
     return {k: v for k, v in param_space.items() if all(i is not None for i in v[1:])}
 
+def _save_optimization_run(run_type, results, selected_files, base_settings, start_date, end_date):
+    """Вспомогательная функция для сохранения результатов оптимизации."""
+    if not results or not results.get('best_params'):
+        st.warning("Нет результатов для сохранения.")
+        return
+
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    
+    if len(selected_files) == 1:
+        filename = selected_files[0]
+        dash_pos = filename.find('-')
+        data_prefix = filename[:dash_pos] if dash_pos != -1 else filename.rsplit('.', 1)[0]
+    elif len(selected_files) > 1:
+        data_prefix = "ALL"
+    else:
+        data_prefix = ""
+
+    def extract_numeric_value(value):
+        if value is None or (isinstance(value, float) and np.isnan(value)): return 0
+        if isinstance(value, (list, tuple)): value = value[0]
+        if hasattr(value, 'item'): value = value.item()
+        numeric_str = ''.join(filter(lambda x: x.isdigit() or x in '.-', str(value)))
+        try: return int(float(numeric_str) + 0.5)
+        except (ValueError, TypeError): return 0
+
+    best_value_num = extract_numeric_value(results.get('best_value'))
+    run_name = f"run_{timestamp}_{data_prefix}_{run_type}_${best_value_num}_OPTUNA"
+    
+    ranges_dict = {k: v for k, v in st.session_state.items() if k.endswith('_optimization')}
+    full_settings = {**base_settings, "start_date": str(start_date), "end_date": str(end_date)}
+    
+    run_data = {
+        "run_name": run_name, "timestamp": datetime.now().isoformat(),
+        "ranges": ranges_dict, "settings": full_settings, "data_files": selected_files,
+        "best_params": results.get('best_params', {}), "optimization_type": f"optuna_{run_type.lower()}",
+        "top_10_results": results.get('top_10_results', [])
+    }
+
+    try:
+        os.makedirs("optimization_runs", exist_ok=True)
+        file_path = os.path.join("optimization_runs", f"{run_name}.json")
+        json_data = json.dumps(run_data, ensure_ascii=False, indent=2, default=lambda o: int(o) if isinstance(o, np.integer) else float(o) if isinstance(o, np.floating) else o.tolist() if isinstance(o, np.ndarray) else str(o))
+        _atomic_write(file_path, json_data)
+        st.success(f"Результаты оптимизации сохранены как '{run_name}'")
+    except Exception as e:
+        st.error(f"Ошибка при сохранении результатов: {str(e)}")
 
 def show_optimization_page():
     """
@@ -101,7 +117,7 @@ def show_optimization_page():
         st.header("Настройки оптимизации")
         position_size, commission, start_date, end_date = get_basic_settings("optimization")
 
-        manage_profiles("optimization", get_optimization_parameters)
+        manage_profiles("optimization", None) # params_func не используется для оптимизации
     
         st.subheader("Параметры оптимизации")
         
@@ -116,13 +132,13 @@ def show_optimization_page():
         with min_cols[0]:
             st.number_input(
                 "Отступ вилки (min, %)",
-                value=float(st.session_state.get("bracket_offset_pct_min_optimization", 0.1)),
+                value=float(st.session_state.get("bracket_offset_pct_min_optimization", 0.2)),
                 min_value=0.01, step=0.01, key="bracket_offset_pct_min_optimization", format="%.2f"
             )
         with min_cols[1]:
             st.number_input(
                 "Тайм-аут (min, свечи)",
-                value=int(st.session_state.get("bracket_timeout_candles_min_optimization", 2)),
+                value=int(st.session_state.get("bracket_timeout_candles_min_optimization", 1)),
                 min_value=1, step=1, key="bracket_timeout_candles_min_optimization"
             )
         with max_cols[0]:
@@ -168,67 +184,39 @@ def show_optimization_page():
                     max_val = st.session_state.get(max_key, min_value_arg)
                     max_val = float(max_val) if p_type == "float" else int(max_val)
                     st.number_input(f"{param_name} (max)", key=max_key, value=max_val, step=step, min_value=min_value_arg)
-
-        st.markdown("**🚀 Климаксный выход**")
-        use_climax_exit_option = st.radio("Оптимизировать климаксный выход?", ("Да", "Нет"), index=1, key="use_climax_exit_option")
-        if use_climax_exit_option == "Да":
-            min_cols, max_cols = st.columns(2), st.columns(2)
-            with min_cols[0]:
-                st.number_input("Окно (min)", value=int(st.session_state.get("climax_exit_window_min_optimization", 5)), min_value=5, step=1, key="climax_exit_window_min_optimization")
-            with min_cols[1]:
-                st.number_input("Порог (min)", value=float(st.session_state.get("climax_exit_threshold_min_optimization", 1.0)), min_value=0.1, step=0.1, key="climax_exit_threshold_min_optimization", format="%.1f")
-            with max_cols[0]:
-                st.number_input("Окно (max)", value=int(st.session_state.get("climax_exit_window_max_optimization", 100)), min_value=5, step=1, key="climax_exit_window_max_optimization")
-            with max_cols[1]:
-                st.number_input("Порог (max)", value=float(st.session_state.get("climax_exit_threshold_max_optimization", 15.0)), min_value=0.1, step=0.1, key="climax_exit_threshold_max_optimization", format="%.1f")
         
-        # --- Новый блок для выбора и настройки классификаторов ---
-        st.markdown("---")
-        st.markdown("### 🤖 Оптимизация классификаторов")
-        
-        # Используем toggle, чтобы можно было полностью отключить ML-часть
-        use_ml_classifiers = st.toggle("Использовать ML классификаторы", value=False, key="use_ml_classifiers", help="Если включено, Optuna будет также выбирать лучший классификатор и его параметры.")
-
-        if use_ml_classifiers:
-            classifier_choices = st.multiselect(
-                "Выберите классификатор для оптимизации",
-                options=["CatBoost"],
-                default=["CatBoost"] if st.session_state.get("use_ml_classifiers") else [],
-                key="classifier_choices"
-            )
-
-            if "CatBoost" in classifier_choices:
-                with st.expander("Настройки CatBoost"):
-                    cb_cols1, cb_cols2 = st.columns(3), st.columns(3)
-                    with cb_cols1[0]: st.number_input("iterations (min)", 50, key="catboost_iterations_min")
-                    with cb_cols1[1]: st.number_input("depth (min)", 4, key="catboost_depth_min")
-                    with cb_cols1[2]: st.number_input("learning_rate (min)", 0.01, format="%.3f", step=0.001, key="catboost_learning_rate_min")
-                    with cb_cols2[0]: st.number_input("iterations (max)", 300, key="catboost_iterations_max")
-                    with cb_cols2[1]: st.number_input("depth (max)", 8, key="catboost_depth_max")
-                    with cb_cols2[2]: st.number_input("learning_rate (max)", 0.2, format="%.3f", step=0.001, key="catboost_learning_rate_max")
+        # --- НОВЫЙ БЛОК: Параметры для ML-модели ---
+        # Эти виджеты будут отображаться всегда, но использоваться только если выбрана ML-цель
+        st.markdown("**🤖 Параметры ML-модели**")
+        ml_param_groups = {
+            "Гиперпараметры CatBoost": [("ml_iterations", "int"), ("ml_depth", "int"), ("ml_learning_rate", "float")],
+            "Параметры признаков и разметки": [("ml_prints_window", "int"), ("ml_labeling_timeout_candles", "int")],
+        }
+        for group_name, params_in_group in ml_param_groups.items():
+            st.markdown(f"**{group_name}**")
+            min_cols = st.columns(len(params_in_group))
+            max_cols = st.columns(len(params_in_group))
             
-            # Новый блок для настройки параметров признаков
-            if classifier_choices:
-                st.markdown("##### Настройки признаков для ML")
-                st.info("Эти параметры определяют, как будут рассчитываться индикаторы, используемые моделью в качестве признаков.")
-                feat_cols1, feat_cols2 = st.columns(2), st.columns(2)
-                with feat_cols1[0]: st.number_input("Prints Period (min/max)", 2, key="prints_analysis_period_min", help="Период для анализа соотношения принтов.")
-                with feat_cols2[0]: st.number_input("Max Prints Period", 10, key="prints_analysis_period_max", label_visibility="collapsed")
-                with feat_cols1[1]: st.number_input("Prints Ratio (min/max)", 1.1, step=0.1, format="%.2f", key="prints_threshold_ratio_min", help="Порог соотношения long/short принтов.")
-                with feat_cols2[1]: st.number_input("Max Prints Ratio", 3.0, step=0.1, format="%.2f", key="prints_threshold_ratio_max", label_visibility="collapsed")
+            for i, (param_name, p_type) in enumerate(params_in_group):
+                step = 0.01 if p_type == "float" else 10 if "iterations" in param_name else 1
+                # --- ИЗМЕНЕНИЕ: Устанавливаем минимальное значение для learning_rate ---
+                if "iterations" in param_name:
+                    base_min_val = 10
+                elif "depth" in param_name:
+                    base_min_val = 2
+                elif "learning_rate" in param_name:
+                    base_min_val = 0.01
+                else:
+                    base_min_val = 1
+                min_value_arg = float(base_min_val) if p_type == "float" else int(base_min_val)
                 
-                feat_cols3, feat_cols4 = st.columns(2), st.columns(2)
-                with feat_cols3[0]: st.number_input("M-Ratio Period (min/max)", 2, key="m_analysis_period_min", help="Период для анализа M-Ratio.")
-                with feat_cols4[0]: st.number_input("Max M-Ratio Period", 10, key="m_analysis_period_max", label_visibility="collapsed")
-                with feat_cols3[1]: st.number_input("M-Ratio (min/max)", 1.1, step=0.1, format="%.2f", key="m_threshold_ratio_min", help="Порог соотношения long/short M-Ratio.")
-                with feat_cols4[1]: st.number_input("Max M-Ratio", 3.0, step=0.1, format="%.2f", key="m_threshold_ratio_max", label_visibility="collapsed")
-
-                feat_cols5, feat_cols6 = st.columns(2), st.columns(2) # Новая строка для HLdir
-                with feat_cols5[0]: st.number_input("HLdir Window (min/max)", 5, key="hldir_window_min_optimization", help="Окно сглаживания для индикатора HLdir.")
-                with feat_cols6[0]: st.number_input("Max HLdir Window", 20, key="hldir_window_max_optimization", label_visibility="collapsed")
-                with feat_cols5[1]: st.number_input("HLdir Offset (min/max)", 0, key="hldir_offset_min_optimization", help="Смещение (shift) для индикатора HLdir. Положительное значение - сдвиг в прошлое.")
-                with feat_cols6[1]: st.number_input("Max HLdir Offset", 10, key="hldir_offset_max_optimization", label_visibility="collapsed")
-
+                with min_cols[i]:
+                    min_key = f"{param_name}_min_optimization"
+                    st.number_input(f"{param_name} (min)", key=min_key, value=st.session_state.get(min_key, min_value_arg), step=step, min_value=min_value_arg)
+                
+                with max_cols[i]:
+                    max_key = f"{param_name}_max_optimization"
+                    st.number_input(f"{param_name} (max)", key=max_key, value=st.session_state.get(max_key, min_value_arg * 2), step=step, min_value=min_value_arg)
 
         col1, col2 = st.columns(2)
         with col1:
@@ -242,17 +230,11 @@ def show_optimization_page():
             help="Остановить оптимизацию, если значение целевой функции достигнет этого уровня."
         )
 
-        backend_choice = st.selectbox(
-            "Бэкенд для параллелизма",
-            options=["threading", "loky"], index=0, key="backend_choice",
-            help="`threading` - быстрее для коротких задач (рекомендуется). `loky` - надежнее, использует процессы вместо потоков (как в WFO Турбо)."
-        )
-
         objective_choice = st.selectbox(
             "Цель оптимизации",
-            options=["SQN (стабильность)", "HFT Score (частота и стабильность)", "SQN, Max Drawdown и Эффективность сигналов (многоцелевая)"],
+            options=["SQN (стабильность)", "HFT Score (частота и стабильность)", "Качество данных для ML (для WFO)", "SQN, Max Drawdown и Эффективность сигналов (многоцелевая)", "SQN с ML-фильтром (Optuna)", "SQN, Max Drawdown, Эффективность + ML (многоцелевая)"],
             index=2, key="objective_choice",
-            help="SQN - ищет стабильные стратегии. HFT Score - для высокочастотных стратегий. Многоцелевая - ищет компромисс между стабильностью, риском и эффективностью."
+            help="SQN - стабильность. HFT Score - для HFT. Качество данных для ML - лучшая цель для WFO с ML-фильтром. Многоцелевая - компромисс. С ML-фильтром (Optuna) - обучает модель на каждой пробе, медленно."
         )
         is_multi_objective = "многоцелевая" in objective_choice
 
@@ -315,6 +297,12 @@ def show_optimization_page():
                     strategy_objective_func = strategy_objectives.trading_strategy_objective_sqn
                 elif "HFT" in objective_choice:
                     strategy_objective_func = strategy_objectives.trading_strategy_objective_hft_score
+                elif "Качество данных для ML" in objective_choice:
+                    strategy_objective_func = strategy_objectives.trading_strategy_objective_ml_data_quality
+                elif "ML" in objective_choice:
+                    strategy_objective_func = strategy_objectives.trading_strategy_objective_ml
+                elif "ML" in objective_choice and is_multi_objective:
+                    strategy_objective_func = strategy_objectives.trading_strategy_multi_objective_ml
                 else: # Многоцелевая
                     strategy_objective_func = strategy_objectives.trading_strategy_multi_objective
 
@@ -322,18 +310,8 @@ def show_optimization_page():
                     'data': combined_df, 'param_space': param_space, 'n_trials': optuna_trials, 'base_settings': base_settings,
                     'strategy_func': strategy_objective_func,
                     'direction': 'maximize' if not is_multi_objective else ['maximize', 'maximize', 'maximize'],
-                    'target_metric_value': target_metric_value,
-                    'backend_choice': backend_choice
+                    'target_metric_value': target_metric_value
                 }
-
-                # --- Автоматический выбор бэкенда при использовании ML ---
-                use_ml = bool(st.session_state.get("classifier_choices"))
-                if use_ml and backend_choice != 'loky':
-                    st.warning(
-                        "Для оптимизации с ML-классификаторами автоматически выбран бэкенд 'loky' для обеспечения "
-                        "настоящего параллелизма при обучении моделей. Ваш выбор 'threading' был проигнорирован."
-                    )
-                    iterative_params['backend_choice'] = 'loky'
 
                 final_results = optuna_optimizer.run_iterative_optimization(iterative_params)
 
@@ -359,6 +337,18 @@ def show_optimization_page():
                         st.subheader("Топ-10 результатов (отсортировано по стабильности)")
                         top_10_df = pd.DataFrame(final_results['top_10_results'])
 
+                        # --- Переупорядочиваем столбцы для лучшей читаемости ---
+                        desired_order = [
+                            "trial_number", "value", "total_pnl", "total_trades", "win_rate", 
+                            "max_drawdown", "profit_factor", "SQN"
+                        ]
+                        # Отбираем существующие колонки из желаемого порядка
+                        available_cols = [col for col in desired_order if col in top_10_df.columns]
+                        # Добавляем остальные колонки (параметры) в конец
+                        remaining_cols = [col for col in top_10_df.columns if col not in available_cols]
+                        top_10_df = top_10_df[available_cols + remaining_cols]
+                        # --- Конец блока переупорядочивания ---
+
                         if is_multi_objective:
                             st.subheader("Фронт Парето")
                             pareto_df = pd.DataFrame(final_results['top_10_results'])
@@ -383,89 +373,51 @@ def show_optimization_page():
 
                             fig_history = optuna.visualization.plot_optimization_history(study)
                             st.plotly_chart(fig_history, use_container_width=True)
+
+                            # --- НОВЫЙ БЛОК: Дополнительные графики анализа параметров ---
+                            st.subheader("Анализ влияния параметров")
+                            optimized_params = list(study.best_params.keys())
+
+                            if optimized_params:
+                                # 1. График срезов (Slice Plot)
+                                st.markdown("#### Срезовый график (Slice Plot)")
+                                st.info("Этот график показывает, как меняется целевая метрика при изменении одного параметра, в то время как остальные зафиксированы на лучших значениях.")
+                                slice_param = st.selectbox("Выберите параметр для срезового графика", options=optimized_params, key="slice_param_select")
+                                if slice_param:
+                                    fig_slice = optuna.visualization.plot_slice(study, params=[slice_param])
+                                    st.plotly_chart(fig_slice, use_container_width=True)
+
+                                # 2. Контурный график (Contour Plot)
+                                if len(optimized_params) >= 2:
+                                    st.markdown("#### Контурный график (Contour Plot)")
+                                    st.info("Этот график показывает зависимость целевой метрики от двух параметров одновременно. Помогает найти их взаимосвязи.")
+                                    cols_contour = st.columns(2)
+                                    with cols_contour[0]:
+                                        contour_param_x = st.selectbox("Выберите параметр для оси X", options=optimized_params, index=0, key="contour_x_select")
+                                    with cols_contour[1]:
+                                        contour_param_y = st.selectbox("Выберите параметр для оси Y", options=[p for p in optimized_params if p != contour_param_x], index=min(1, len(optimized_params)-2), key="contour_y_select")
+                                    if contour_param_x and contour_param_y:
+                                        fig_contour = optuna.visualization.plot_contour(study, params=[contour_param_x, contour_param_y])
+                                        st.plotly_chart(fig_contour, use_container_width=True)
+                            # --- Конец нового блока ---
+
                         except Exception as e:
                             st.warning(f"Не удалось построить графики анализа Optuna: {e}")
 
                 else:
                     st.error("Итеративная оптимизация завершилась, но не удалось найти ни одного подходящего набора параметров.")
 
-                # --- Начало блока сохранения результатов итеративной оптимизации ---
-                if final_results and final_results.get('best_params'):
-                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                    
-                    if len(selected_files) == 1:
-                        filename = selected_files[0]
-                        dash_pos = filename.find('-')
-                        data_prefix = filename[:dash_pos] if dash_pos != -1 else filename.rsplit('.', 1)[0]
-                    elif len(selected_files) > 1:
-                        data_prefix = "ALL"
-                    else:
-                        data_prefix = ""
-
-                    def extract_numeric_value(value_str):
-                        if value_str is None or (isinstance(value_str, float) and np.isnan(value_str)):
-                            return 0
-                        if isinstance(value_str, (list, tuple)): # Для многоцелевой
-                            value_str = value_str[0]
-                        if hasattr(value_str, 'dtype') and np.issubdtype(value_str.dtype, np.number):
-                            value_str = value_str.item()
-                        numeric_str = ''.join(filter(lambda x: x.isdigit() or x == '.', str(value_str).replace('$', '').replace('%', '').replace('-', '')))
-                        try:
-                            return int(float(numeric_str) + 0.5)
-                        except (ValueError, TypeError):
-                            return 0
-
-                    best_value = extract_numeric_value(final_results.get('best_value'))
-                    mode_suffix = "_ITERATIVE"
-                    new_run_name = f"run_{timestamp}_{data_prefix}{mode_suffix}_${best_value}_OPTUNA"
-                    
-                    ranges_dict = {k: v for k, v in st.session_state.items() if k.endswith('_optimization')}
-                    
-                    # Собираем полные базовые настройки, включая даты
-                    full_base_settings = {
-                        **base_settings,
-                        "start_date": str(start_date), "end_date": str(end_date)
-                    }
-                    run_data = {
-                        "run_name": new_run_name, "timestamp": datetime.now().isoformat(),
-                        "ranges": ranges_dict, "settings": full_base_settings,
-                        "data_files": selected_files, "best_params": final_results.get('best_params', {}),
-                        "optimization_type": "optuna_iterative",
-                        "top_10_results": final_results.get('top_10_results', [])
-                    }
-                    
-                    def convert_numpy_types(obj):
-                        if isinstance(obj, (datetime, date)): return obj.isoformat()
-                        if isinstance(obj, np.integer): return int(obj)
-                        elif isinstance(obj, np.floating): return float(obj)
-                        elif isinstance(obj, np.ndarray): return obj.tolist()
-                        elif isinstance(obj, dict): return {key: convert_numpy_types(value) for key, value in obj.items()}
-                        elif isinstance(obj, list): return [convert_numpy_types(item) for item in obj]
-                        else: return obj
-                    
-                    run_data_converted = convert_numpy_types(run_data)
-                    
-                    try:
-                        os.makedirs("optimization_runs", exist_ok=True)
-                        file_path = f"optimization_runs/{new_run_name}.json"
-                        json_data = json.dumps(run_data_converted, ensure_ascii=False, indent=2)
-                        _atomic_write(file_path, json_data)
-                        st.success(f"Результаты итеративной оптимизации сохранены как '{new_run_name}'")
-                    except (IOError, OSError) as e:
-                        st.error(f"Ошибка ввода-вывода при сохранении результатов: {str(e)}")
-                    except Exception as e:
-                        st.error(f"Ошибка при сохранении результатов итеративной оптимизации: {str(e)}")
-                # --- Конец блока сохранения ---
+                _save_optimization_run("ITERATIVE", final_results, selected_files, base_settings, start_date, end_date)
 
     st.markdown("---")
     st.subheader("Walk-Forward Optimization (WFO)")
-    with st.expander("Настройки WFO и скрининга", expanded=True):
+    with st.expander("Настройки WFO", expanded=True):
         wfo_unit_cols = st.columns(4)
         with wfo_unit_cols[0]:
             wfo_unit = st.selectbox("Единица измерения WFO", ["Дни", "Часы"], key="wfo_unit")
         
         unit_label = "дни" if wfo_unit == "Дни" else "часы"
-        default_train = 7 if wfo_unit == "Дни" else 168 # 7 дней
+        default_train = 1 if wfo_unit == "Дни" else 24 # 1 дней
         default_test = 1 if wfo_unit == "Дни" else 24 # 1 день
         default_step = 1 if wfo_unit == "Дни" else 24 # 1 день
 
@@ -482,43 +434,14 @@ def show_optimization_page():
         with wfo_cols[1]:
             st.number_input("Мин. сделок для WFO", value=10, min_value=1, step=1, key="wfo_min_trades_threshold", help="Минимальное количество сделок на обучающем отрезке, чтобы результат считался значимым. Если сделок меньше, стратегия получит штраф.")
 
-        st.markdown("##### Настройки предварительного скрининга для WFO")
-        use_wfo_anchoring = st.toggle(
-            "Анкерная оптимизация WFO",
-            value=True,
-            key="use_wfo_anchoring",
-            help="Если включено, лучшие параметры с предыдущего шага WFO будут использованы как первая проба для следующего шага. Это может ускорить сходимость."
-        )
+    # --- УПРОЩЕНИЕ: Оставляем одну кнопку для запуска WFO в режиме сравнения ---
+    run_wfo_comparison_button = st.button(
+        "⚡ Запустить WFO (ML vs. Baseline)",
+        key="run_wfo_comparison",
+        help="Запускает два WFO-прогона (с ML и без) и сравнивает их результаты. Это самый быстрый и рекомендуемый режим."
+    )
 
-        screening_cols = st.columns(3)
-        with screening_cols[0]:
-            look_forward_period = st.number_input("Горизонт скрининга (свечи)", value=20, min_value=1, step=1, key="wfo_look_forward_period", help="На сколько свечей вперед смотреть для определения 'перспективности' сигнала.")
-        with screening_cols[1]:
-            profit_target_pct = st.number_input("Цель по прибыли (%)", value=2.0, min_value=0.1, step=0.1, key="wfo_profit_target_pct", format="%.1f", help="Какой процент прибыли должен быть достигнут, чтобы сигнал считался перспективным.")
-        with screening_cols[2]:
-            loss_limit_pct = st.number_input("Ограничение убытка (%)", value=1.0, min_value=0.1, step=0.1, key="wfo_loss_limit_pct", format="%.1f", help="При достижении этого убытка сигнал считается неперспективным.")
-
-        use_screening_for_wfo = st.toggle(
-            "Использовать скрининг в WFO", 
-            value=True, 
-            key="use_screening_for_wfo",
-            help="Если включено, Optuna будет обучаться только на 'перспективных' сигналах, найденных на обучающем отрезке. Это может улучшить качество оптимизации."
-        )
-
-    wfo_button_cols = st.columns([2, 2, 1])
-    with wfo_button_cols[0]:
-        run_wfo_button = st.button("🚀 Запустить WFO (пошагово)", key="run_wfo", help="Запускает пошаговую оптимизацию с выводом прогресса в реальном времени. Медленнее, но информативнее.")
-    with wfo_button_cols[1]:
-        run_wfo_parallel_button = st.button("⚡ Запустить WFO (Турбо)", key="run_wfo_parallel", help="Запускает все оптимизации WFO параллельно. Максимально быстро, но результат отображается только в конце.")
-    with wfo_button_cols[2]:
-        show_wfo_progress = st.toggle("Показывать прогресс", value=True, key="show_wfo_progress", help="Отключите для ускорения WFO. Прогресс будет виден в консоли, а в UI отобразится только финальный результат.")
-
-    # Определяем, какая кнопка была нажата
-    run_mode = None
-    if run_wfo_button: run_mode = 'sequential'
-    if run_wfo_parallel_button: run_mode = 'parallel'
-
-    if run_mode:
+    if run_wfo_comparison_button:
         if not dataframes:
             st.warning("Пожалуйста, выберите хотя бы один Parquet-файл для WFO.")
         else:
@@ -528,20 +451,15 @@ def show_optimization_page():
 
             param_space = get_param_space_from_ui()
 
-            # Выбор целевой функции в зависимости от выбора пользователя
-            if "SQN" in objective_choice and not is_multi_objective:
-                strategy_objective_func = strategy_objectives.trading_strategy_objective_sqn
-            elif "HFT" in objective_choice:
-                strategy_objective_func = strategy_objectives.trading_strategy_objective_hft_score
-            else: # Многоцелевая
-                strategy_objective_func = strategy_objectives.trading_strategy_multi_objective
-
+            # Собираем базовые настройки для передачи в WFO
+            base_settings = {
+                'position_size': position_size, 'commission': commission,
+                'aggressive_mode': st.session_state.get("aggressive_mode_optimization", False),
+            }
             opt_params_for_wfo = {
                 'param_space': param_space,
                 'direction': 'maximize' if not is_multi_objective else ['maximize', 'maximize', 'maximize'],
-                'position_size': position_size, 'commission': commission,
-                'aggressive_mode': st.session_state.get("aggressive_mode_optimization", False),
-                'strategy_func': strategy_objective_func
+                'base_settings': base_settings
             }
 
             # Собираем параметры WFO и скрининга
@@ -551,86 +469,95 @@ def show_optimization_page():
                 'step_period': st.session_state.get("wfo_step_period", 1),
                 'trials_per_step': st.session_state.get("wfo_trials_per_step", 25),
                 'wfo_unit': st.session_state.get("wfo_unit", "Дни"),
-                'look_forward_period': st.session_state.get("wfo_look_forward_period", 20),
                 'min_trades_threshold': st.session_state.get("wfo_min_trades_threshold", 10),
-                'profit_target_pct': st.session_state.get("wfo_profit_target_pct", 2.0),
-                'loss_limit_pct': st.session_state.get("wfo_loss_limit_pct", 1.0),
-                'use_anchoring': use_wfo_anchoring, # Передаем новый параметр
             }
 
-            if run_mode == 'sequential':
-                wfo_results = wfo_optimizer.run_wfo(
-                    combined_df, 
-                    wfo_params, 
-                    opt_params_for_wfo, 
-                    use_screening=use_screening_for_wfo,
-                    objective_name=objective_choice,
-                    show_progress_ui=show_wfo_progress
-                )
-            else: # parallel mode
-                wfo_results = wfo_optimizer.run_wfo_parallel(
-                    combined_df, wfo_params, opt_params_for_wfo, use_screening=use_screening_for_wfo
-                )
+            # --- Логика для режима сравнения ---
+            st.header("Сравнение WFO: ML-фильтр vs. Baseline")
 
-            if wfo_results and wfo_results['summary']:
-                st.balloons()
-                summary_df = pd.DataFrame(wfo_results['summary'])
-                st.subheader("Результаты WFO")
-                st.dataframe(summary_df, use_container_width=True)
-                st.subheader("Итоговые метрики (Out-of-Sample)")
-                st.json(wfo_results['aggregated_metrics'])
+            # --- Запуск 1: WFO с ML-фильтром ---
+            st.subheader("1. Запуск WFO с ML-фильтром (используя цель 'Качество данных для ML')")
+            opt_params_ml = opt_params_for_wfo.copy()
+            # Используем специальную цель для поиска лучших данных для ML
+            opt_params_ml['strategy_func'] = strategy_objectives.trading_strategy_objective_ml_data_quality
+            # Добавляем флаг, чтобы wfo_optimizer знал, что нужно применить ML
+            opt_params_ml['is_ml_wfo'] = True
+            results_ml = wfo_optimizer.run_wfo_parallel(combined_df, wfo_params, opt_params_ml)
+            if not results_ml or not results_ml['summary']:
+                st.error("Прогон WFO с ML-фильтром не дал результатов. Сравнение прервано.")
+                st.stop()
+            st.success("Прогон с ML-фильтром завершен.")
 
-                fig = visualizer.plot_wfo_results(summary_df, wfo_results['equity_curve'], wfo_results['aggregated_metrics'])
-                st.plotly_chart(fig, use_container_width=True)
-
-                # --- Дополнительные графики для анализа WFO ---
-                st.subheader("Углубленный анализ WFO")
-
-                # 1. График стабильности параметров
-                param_space = get_param_space_from_ui()
-                fig_params = visualizer.plot_wfo_parameter_stability(summary_df, param_space)
-                if fig_params:
-                    st.plotly_chart(fig_params, use_container_width=True)
-
-                # 2. График сравнения In-Sample vs Out-of-Sample
-                fig_is_oos = visualizer.plot_wfo_insample_vs_outsample(summary_df)
-                if fig_is_oos:
-                    st.plotly_chart(fig_is_oos, use_container_width=True)
-
-                # 3. График важности признаков
-                fig_feat_imp = visualizer.plot_wfo_feature_importance(summary_df)
-                if fig_feat_imp:
-                    st.plotly_chart(fig_feat_imp, use_container_width=True)
-
-                # --- Конец блока дополнительных графиков ---
-
-                # --- Отображение и применение предложенных диапазонов ---
-                if wfo_results.get('suggested_ranges'):
-                    st.subheader("💡 Предлагаемые диапазоны для следующей оптимизации")
-                    st.info("Эти диапазоны основаны на параметрах, показавших лучший результат на успешных (прибыльных) шагах WFO.")
-                    
-                    suggested_df = pd.DataFrame.from_dict(wfo_results['suggested_ranges'], orient='index')
-                    suggested_df.reset_index(inplace=True)
-                    suggested_df.columns = ['Параметр', 'Рекомендуемый min', 'Рекомендуемый max']
-                    st.dataframe(suggested_df, use_container_width=True)
-
-                    if st.button("✅ Применить предложенные диапазоны", key="apply_wfo_ranges"):
-                        for _, row in suggested_df.iterrows():
-                            param_name = row['Параметр']
-                            min_key = f"{param_name}_min_optimization"
-                            max_key = f"{param_name}_max_optimization"
-                            
-                            # Обновляем session_state, чтобы виджеты в сайдбаре изменились
-                            if min_key in st.session_state:
-                                st.session_state[min_key] = row['Рекомендуемый min']
-                            if max_key in st.session_state:
-                                st.session_state[max_key] = row['Рекомендуемый max']
-                        st.success("Диапазоны в сайдбаре обновлены! Можете запустить новую оптимизацию.")
-                        st.rerun() # Перезапускаем скрипт, чтобы виджеты обновились
-                        return # Важно! Прерываем выполнение, чтобы избежать перезаписи session_state
+            # --- Запуск 2: WFO без ML (Baseline) ---
+            st.subheader("2. Запуск WFO без ML-фильтра (Baseline)")
+            opt_params_no_ml = opt_params_for_wfo.copy()
+            if is_multi_objective:
+                opt_params_no_ml['strategy_func'] = strategy_objectives.trading_strategy_multi_objective
             else:
-                st.warning("WFO не дал результатов для визуализации.")
+                opt_params_no_ml['strategy_func'] = strategy_objectives.trading_strategy_objective_sqn
+            results_no_ml = wfo_optimizer.run_wfo_parallel(combined_df, wfo_params, opt_params_no_ml)
+            if not results_no_ml or not results_no_ml['summary']:
+                st.error("Прогон WFO без ML-фильтра не дал результатов. Сравнение прервано.")
+                st.stop()
+            st.success("Прогон без ML-фильтра завершен.")
+
+            # --- Отображение результатов ---
+            st.header("Итоги сравнения")
+
+            # Сравнительная таблица метрик
+            comparison_metrics_df = pd.DataFrame([
+                {"Метод": "С ML-фильтром", **results_ml['aggregated_metrics']},
+                {"Метод": "Без ML (Baseline)", **results_no_ml['aggregated_metrics']}
+            ]).set_index("Метод")
+            st.dataframe(comparison_metrics_df.T) # Транспонируем для лучшей читаемости
+
+            # Сравнительный график Equity
+            fig_comp = visualizer.plot_wfo_comparison(results_ml, results_no_ml)
+            st.plotly_chart(fig_comp, use_container_width=True)
+
+            # Дополнительные графики для анализа ML
+            summary_ml_df = pd.DataFrame(results_ml.get('summary', []))
+            summary_no_ml_df = pd.DataFrame(results_no_ml.get('summary', []))
+
+            # График эффективности ML-фильтра (сколько сделок отфильтровано)
+            # и сравнение Win Rate по шагам.
+            fig_ml_eff = visualizer.plot_wfo_ml_effectiveness(summary_ml_df, summary_no_ml_df)
+            st.plotly_chart(fig_ml_eff, use_container_width=True)
     
+            # NEW: Plot risk metrics per step
+            if not summary_ml_df.empty:
+                st.subheader("Метрики риска и доходности по шагам WFO (с ML-фильтром)")
+                fig_risk_ml = visualizer.plot_wfo_risk_metrics(summary_ml_df)
+                if fig_risk_ml:
+                    st.plotly_chart(fig_risk_ml, use_container_width=True)
+            
+            if not summary_no_ml_df.empty:
+                st.subheader("Метрики риска и доходности по шагам WFO (без ML-фильтра)")
+                fig_risk_no_ml = visualizer.plot_wfo_risk_metrics(summary_no_ml_df)
+                if fig_risk_no_ml:
+                    st.plotly_chart(fig_risk_no_ml, use_container_width=True)
+            
+            # --- НОВЫЙ БЛОК: Сохранение отчета ---
+            st.subheader("Сохранение отчета")
+            report_name = f"WFO_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            
+            with st.spinner("Генерация HTML-отчета..."):
+                html_report = visualizer.create_wfo_report_html(
+                    results_ml=results_ml,
+                    results_no_ml=results_no_ml,
+                    param_space=param_space,
+                    run_name=report_name
+                )
+            
+            st.download_button(
+                label="📥 Скачать HTML-отчет",
+                data=html_report,
+                file_name=f"{report_name}.html",
+                mime="text/html",
+                help="Сохранить все результаты и графики этого сравнения в один HTML-файл."
+            )
+            # --- Конец нового блока ---
+
     if st.session_state.get('optimization_running', False):
         if st.button("❌ Остановить оптимизацию", type="primary", key="stop_opt_button"):
             with open('stop_optimization.flag', 'w') as f:
@@ -663,6 +590,12 @@ def show_optimization_page():
                 strategy_objective_func = strategy_objectives.trading_strategy_objective_sqn
             elif "HFT" in objective_choice:
                 strategy_objective_func = strategy_objectives.trading_strategy_objective_hft_score
+            elif "Качество данных для ML" in objective_choice:
+                strategy_objective_func = strategy_objectives.trading_strategy_objective_ml_data_quality
+            elif "ML" in objective_choice:
+                strategy_objective_func = strategy_objectives.trading_strategy_objective_ml
+            elif "ML" in objective_choice and is_multi_objective:
+                strategy_objective_func = strategy_objectives.trading_strategy_multi_objective_ml
             else: # Многоцелевая
                 strategy_objective_func = strategy_objectives.trading_strategy_multi_objective
 
@@ -670,20 +603,9 @@ def show_optimization_page():
                 'data': combined_df, 'param_space': param_space, 'n_trials': optuna_trials,
                 'direction': 'maximize' if not is_multi_objective else ['maximize', 'maximize', 'maximize'],
                 'base_settings': base_settings, 'data_files': selected_files,
-                'strategy_func': strategy_objective_func,
-                'target_metric_value': target_metric_value,
-                'backend_choice': backend_choice
+                'strategy_func': strategy_objective_func, 'target_metric_value': target_metric_value
             }
             
-            # --- Автоматический выбор бэкенда при использовании ML ---
-            use_ml = bool(st.session_state.get("classifier_choices"))
-            if use_ml and backend_choice != 'loky':
-                st.warning(
-                    "Для оптимизации с ML-классификаторами автоматически выбран бэкенд 'loky' для обеспечения "
-                    "настоящего параллелизма при обучении моделей. Ваш выбор 'threading' был проигнорирован."
-                )
-                opt_params_to_run['backend_choice'] = 'loky'
-
             st.session_state['opt_params_to_run'] = opt_params_to_run
             st.session_state['optimization_running'] = True
             st.rerun()    
@@ -714,6 +636,21 @@ def show_optimization_page():
                         st.subheader("Топ-10 результатов оптимизации")
                         top_10_df = pd.DataFrame(opt_results['top_10_results'])
 
+                        # --- Переупорядочиваем столбцы для лучшей читаемости ---
+                        desired_order = [
+                            "trial_number", "value", "total_pnl", "total_trades", "win_rate", 
+                            "max_drawdown", "profit_factor", "SQN"
+                        ]
+                        # Отбираем существующие колонки из желаемого порядка
+                        available_cols = [col for col in desired_order if col in top_10_df.columns]
+                        # Добавляем остальные колонки (параметры) в конец
+                        remaining_cols = [col for col in top_10_df.columns if col not in available_cols]
+                        top_10_df = top_10_df[available_cols + remaining_cols]
+                        # --- Конец блока переупорядочивания ---
+
+                        # Отображаем таблицу для всех случаев, когда есть top_10_results
+                        st.dataframe(top_10_df, use_container_width=True)
+
                         if is_multi_objective:
                             st.subheader("Фронт Парето")
                             pareto_df = top_10_df.copy()
@@ -726,14 +663,6 @@ def show_optimization_page():
                                 title="Компромисс между стабильностью (SQN) и риском (Max Drawdown)"
                             )
                             st.plotly_chart(fig, use_container_width=True)
-                        # Отображаем таблицу для всех случаев, когда есть top_10_results, а не только для многоцелевой
-                        
-                        # Улучшаем читаемость таблицы с параметрами классификаторов
-                        if any('classifier_type' in res for res in opt_results['top_10_results']):
-                            cleaned_results = [optuna_optimizer._flatten_conditional_params(res.copy()) for res in opt_results['top_10_results']]
-                            top_10_df = pd.DataFrame(cleaned_results)
-
-                        st.dataframe(top_10_df, use_container_width=True)
 
                         # Добавляем графики анализа
                         study = opt_results.get('study')
@@ -741,9 +670,35 @@ def show_optimization_page():
                             st.subheader("Анализ процесса оптимизации")
                             fig_importance = optuna.visualization.plot_param_importances(study)
                             st.plotly_chart(fig_importance, use_container_width=True)
-                        st.dataframe(top_10_df, use_container_width=True)
-                else:
-                    st.error("Оптимизация завершилась, но не удалось найти ни одного подходящего набора параметров. Попробуйте расширить диапазоны оптимизации или проверить данные.")
+
+                            # --- НОВЫЙ БЛОК: Дополнительные графики анализа параметров ---
+                            st.subheader("Анализ влияния параметров")
+                            optimized_params = list(study.best_params.keys())
+
+                            if optimized_params:
+                                # 1. График срезов (Slice Plot)
+                                st.markdown("#### Срезовый график (Slice Plot)")
+                                st.info("Этот график показывает, как меняется целевая метрика при изменении одного параметра, в то время как остальные зафиксированы на лучших значениях.")
+                                slice_param_simple = st.selectbox("Выберите параметр для срезового графика", options=optimized_params, key="slice_param_select_simple")
+                                if slice_param_simple:
+                                    fig_slice_simple = optuna.visualization.plot_slice(study, params=[slice_param_simple])
+                                    st.plotly_chart(fig_slice_simple, use_container_width=True)
+
+                                # 2. Контурный график (Contour Plot)
+                                if len(optimized_params) >= 2:
+                                    st.markdown("#### Контурный график (Contour Plot)")
+                                    st.info("Этот график показывает зависимость целевой метрики от двух параметров одновременно. Помогает найти их взаимосвязи.")
+                                    cols_contour_simple = st.columns(2)
+                                    with cols_contour_simple[0]:
+                                        contour_param_x_simple = st.selectbox("Выберите параметр для оси X", options=optimized_params, index=0, key="contour_x_select_simple")
+                                    with cols_contour_simple[1]:
+                                        # Убедимся, что второй параметр не совпадает с первым
+                                        available_y_params = [p for p in optimized_params if p != contour_param_x_simple]
+                                        contour_param_y_simple = st.selectbox("Выберите параметр для оси Y", options=available_y_params, index=min(0, len(available_y_params)-1), key="contour_y_select_simple")
+                                    if contour_param_x_simple and contour_param_y_simple:
+                                        fig_contour_simple = optuna.visualization.plot_contour(study, params=[contour_param_x_simple, contour_param_y_simple])
+                                        st.plotly_chart(fig_contour_simple, use_container_width=True)
+                            # --- Конец нового блока ---
                 
                 timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
                 
@@ -756,65 +711,11 @@ def show_optimization_page():
                 else:
                     data_prefix = ""
                 
-                def extract_numeric_value(value_str):
-                    if value_str is None or (isinstance(value_str, float) and np.isnan(value_str)):
-                        return 0
-                    if isinstance(value_str, (list, tuple)): # Для многоцелевой
-                        value_str = value_str[0]
-                    if hasattr(value_str, 'dtype') and np.issubdtype(value_str.dtype, np.number):
-                        value_str = value_str.item()
-                    numeric_str = ''.join(filter(lambda x: x.isdigit() or x == '.', str(value_str).replace('$', '').replace('%', '').replace('-', '')))
-                    try:
-                        return int(float(numeric_str) + 0.5)
-                    except ValueError:
-                        return 0
-                
-                best_value = extract_numeric_value(opt_results.get('best_value'))
-                mode_suffix = "_mode1"
-                new_run_name = f"run_{timestamp}_{data_prefix}{mode_suffix}_${best_value}_OPTUNA"
-                
-                ranges_dict = {k: v for k, v in st.session_state.items() if k.endswith('_optimization')}
-                
-                # Обновляем `settings`, чтобы включить все базовые параметры
-                full_settings = {
-                    **base_settings,
-                    "start_date": str(start_date), "end_date": str(end_date)
-                }
-                optuna_results = []
-                if opt_results and opt_results.get('best_params'):
-                    # Используем top_10_results, которые уже содержат все нужные метрики
-                    optuna_results = opt_results.get('top_10_results', [])
-                
-                run_data = {
-                    "run_name": new_run_name, "timestamp": datetime.now().isoformat(),
-                    "ranges": ranges_dict,
-                    "settings": full_settings,
-                    "data_files": selected_files,
-                    "best_params": opt_results.get('best_params', {}),
-                    "optimization_type": "optuna",
-                    "top_10_results": opt_results.get('top_10_results', [])
-                }
-                
-                def convert_numpy_types(obj):
-                    if isinstance(obj, np.integer): return int(obj)
-                    elif isinstance(obj, np.floating): return float(obj)
-                    elif isinstance(obj, np.ndarray): return obj.tolist()
-                    elif isinstance(obj, dict): return {key: convert_numpy_types(value) for key, value in obj.items()}
-                    elif isinstance(obj, list): return [convert_numpy_types(item) for item in obj]
-                    else: return obj
-                
-                run_data_converted = convert_numpy_types(run_data)
-                
-                try:
-                    os.makedirs("optimization_runs", exist_ok=True)
-                    file_path = f"optimization_runs/{new_run_name}.json"
-                    json_data = json.dumps(run_data_converted, ensure_ascii=False, indent=2)
-                    _atomic_write(file_path, json_data)
-                    st.success(f"Результаты Optuna оптимизации сохранены как '{new_run_name}'")
-                except (IOError, OSError) as e:
-                    st.error(f"Ошибка ввода-вывода при сохранении результатов: {str(e)}")
-                except Exception as e:
-                    st.error(f"Ошибка при сохранении результатов Optuna оптимизации: {str(e)}")
+                _save_optimization_run("SIMPLE", opt_results, selected_files, base_settings, start_date, end_date)
+
+        except optuna.exceptions.TrialPruned as e:
+            # Обрабатываем случай, когда все пробы были неудачными
+            st.error(f"Оптимизация была прервана, так как не удалось получить ни одного валидного результата. Последняя ошибка: {e}")
         except Exception as e:
             st.error(f"Ошибка при запуске Optuna оптимизации: {str(e)}")
         finally:

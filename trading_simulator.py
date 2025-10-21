@@ -4,16 +4,7 @@ import time
 
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from signal_generator import generate_signals, find_future_outcomes # type: ignore
-# --- ИЗМЕНЕНИЕ: Импортируем новый обработчик ML ---
-from ml_model_handler import train_ml_model
-
-try:
-    from catboost import CatBoostClassifier
-    CATBOOST_AVAILABLE = True
-except ImportError:
-    CatBoostClassifier = None
-    CATBOOST_AVAILABLE = False
+from signal_generator import generate_signals # type: ignore
 
 try:
     import numba
@@ -42,7 +33,6 @@ class TradingSimulator:
            commission: комиссия в процентах
            stop_loss_pct: стоп-лосс в процентах
            take_profit_pct: тейк-профит в процентах
-           use_hldir: использовать ли HLdir для определения направления (если доступен)
        """
        self.position_size = position_size
        self.commission = commission / 100  # преобразуем в доли
@@ -52,10 +42,7 @@ class TradingSimulator:
        self.pnl_history = []
        self.balance_history = []
        self.current_position = None
-       self.total_signals = 0
-       self.initial_balance = position_size
-       self.ml_rejected_signals = []
-       # Всегда используем HLdir, если он присутствует в данных
+       self.initial_balance = position_size # type: ignore
         
     def calculate_stop_loss_take_profit(self, entry_price, direction):
         """
@@ -165,7 +152,7 @@ class TradingSimulator:
         
         return pnl_amount
 
-    def simulate_trades(self, df, params, aggressive_mode=False, screening_mode=False):
+    def simulate_trades(self, df, params, aggressive_mode=False):
         """
         Симуляция торговли
 
@@ -173,103 +160,42 @@ class TradingSimulator:
             df: DataFrame с рыночными данными
             params: параметры стратегии
             aggressive_mode: если True, позволяет открывать новые сделки, не дожидаясь закрытия старых
-            screening_mode: если True, торгует только по "перспективным" сигналам (для обучения)
 
-        Returns:
-            словарь с результатами симуляции
+        Returns: словарь с результатами симуляции
         """
-        # Извлекаем параметры для определения направления
-        use_climax_exit = params.get("use_climax_exit", False)
-        # Новые параметры для входа по "вилке"
         bracket_offset_pct = params.get("bracket_offset_pct", 0.5)
         bracket_timeout_candles = params.get("bracket_timeout_candles", 5)
-
-        climax_exit_window = params.get("climax_exit_window", 50)
-        climax_exit_threshold = params.get("climax_exit_threshold", 3.0)
 
         # Начинаем собирать использованные параметры
         used_params = {"position_size", "commission", "stop_loss_pct", "take_profit_pct"}
 
 
-        # Определяем, нужно ли генерировать только базовые сигналы (для "Вилки")
-        # Теперь всегда генерируем только базовые сигналы, так как другие стратегии удалены
-        base_signal_only = True
-        # Генерируем базовые сигналы. Индикаторы для ML будут сгенерированы отдельно, если нужно.
-        # signal_indices, indicators, signal_gen_used_params = generate_signals(df, params, base_signal_only=False)
-        # Возвращаем base_signal_only=True, т.к. индикаторы для ML будем генерировать отдельно
-        signal_indices, indicators, signal_gen_used_params = generate_signals(df, params, base_signal_only=base_signal_only)
+        # --- ИСПРАВЛЕНИЕ: Генерируем все индикаторы и сигналы ОДИН РАЗ ---
+        # base_signal_only=False гарантирует, что мы получим и базовые сигналы,
+        # и все индикаторы, которые могут понадобиться для ML в качестве признаков.
+        signal_indices, _, signal_gen_used_params = generate_signals(df, params)
+        self.total_signals = len(signal_indices) # Store total signals before ML filtering
         used_params.update(signal_gen_used_params)
-        self.total_signals = len(signal_indices)
-        
-        open_prices = df['open'].values
-        high_prices = df['high'].values
-        low_prices = df['low'].values
-        close_prices = df['close'].values
-        xp = np
-        hldir_values = df['HLdir'].values
-        long_prints_values = df['long_prints'].values
-        short_prints_values = df['short_prints'].values
 
-        # 3. Предварительно рассчитываем Climax Score для всех свечей
-        long_climax_scores = xp.zeros(len(df))
-        short_climax_scores = xp.zeros(len(df))
-        if use_climax_exit:
-            used_params.update({"use_climax_exit", "climax_exit_window", "climax_exit_threshold"})
-            price_range = high_prices - low_prices
-            # Используем pandas для удобного расчета скользящих окон
-            s_long_prints = pd.Series(df['long_prints'].values)
-            s_short_prints = pd.Series(df['short_prints'].values)
-            s_range = pd.Series(price_range)
+        # --- ИСПРАВЛЕНИЕ: Генерируем DataFrame со всеми индикаторами для ML ---
+        # Вызываем generate_signals с return_indicators=True, чтобы получить df с признаками
+        signal_indices, df_with_features, signal_gen_used_params = generate_signals(df, params, return_indicators=True)
+        if df_with_features is None: # На случай, если что-то пошло не так
+            df_with_features = df.copy() # Возвращаемся к исходному df
+        # --- НОВЫЙ БЛОК: Генерируем ML-признаки, если модель будет использоваться ---
+        if params.get('ml_model_bundle') and params.get('use_ml_filter'):
+            from ml_model_handler import generate_features # Локальный импорт
+            df_with_features = generate_features(df_with_features, params)
+        used_params.update(signal_gen_used_params)
 
-            # Скользящие статистики
-            rolling_window = s_long_prints.rolling(window=climax_exit_window, min_periods=1)
-            long_prints_ma = rolling_window.mean().values
-            long_prints_std = rolling_window.std().values
-            rolling_window_short = s_short_prints.rolling(window=climax_exit_window, min_periods=1)
-            short_prints_ma = rolling_window_short.mean().values
-            short_prints_std = rolling_window_short.std().values
-            range_ma = s_range.rolling(window=climax_exit_window, min_periods=1).mean().values
-
-            # Z-score и volatility_factor
-            long_prints_z = xp.divide(long_prints_values - long_prints_ma, long_prints_std, where=long_prints_std > 1e-6, out=xp.zeros_like(long_prints_values, dtype=float))
-            short_prints_z = xp.divide(short_prints_values - short_prints_ma, short_prints_std, where=short_prints_std > 1e-6, out=xp.zeros_like(short_prints_values, dtype=float))
-            volatility_factor = xp.divide(price_range, range_ma, where=range_ma > 1e-6, out=xp.zeros_like(price_range, dtype=float))
-            long_climax_scores = long_prints_z * volatility_factor
-            short_climax_scores = short_prints_z * volatility_factor
+        open_prices = df_with_features['open'].values
+        high_prices = df_with_features['high'].values
+        low_prices = df_with_features['low'].values
+        close_prices = df_with_features['close'].values
+        hldir_values = df_with_features['HLdir'].values if 'HLdir' in df_with_features.columns else np.zeros_like(open_prices)
+        xp = np # Используется для np.ones
 
         # 2. Итерируемся по сигналам, а не по всем свечам
-        entry_indices = sorted(list(signal_indices))
-        if not entry_indices: # Если нет сигналов, выходим
-            return self.calculate_metrics()
-
-        # --- ЭТАП ПОДГОТОВКИ И ОБУЧЕНИЯ МОДЕЛИ (если используется) ---
-        model = None
-        scaler = None
-        feature_df = None
-        feature_importances = None
-
-        # --- ИЗМЕНЕНИЕ: Вызываем новый обработчик ML ---
-        # Вся логика обучения, кэширования и генерации признаков теперь инкапсулирована.
-        if params.get("classifier_type"):
-            ml_results = train_ml_model(df, params, entry_indices)
-            model = ml_results['model']
-            scaler = ml_results['scaler']
-            feature_df = ml_results['feature_df']
-            feature_importances = ml_results['feature_importances']
-            used_params.update(ml_results['used_params'])
-
-        # --- ЭТАП СКРИНИНГА ---
-        # Если включен режим скрининга, фильтруем сигналы, оставляя только "перспективные"
-        if screening_mode:
-            used_params.add("screening_mode")
-            promising_long_mask = df['promising_long'].values
-            promising_short_mask = df['promising_short'].values
-        else: # Иначе создаем маски, которые пропускают все сигналы
-            promising_long_mask = np.ones(len(df), dtype=bool)
-            promising_short_mask = np.ones(len(df), dtype=bool)
-
-        if not entry_indices: # Если нет сигналов, выходим
-            return self.calculate_metrics()
 
         current_idx = 0
         signal_queue = sorted(list(set(signal_indices))) # Уникальные и отсортированные
@@ -289,49 +215,110 @@ class TradingSimulator:
             if analysis_idx >= len(df) - 1:
                 continue # Не можем войти, так как это предпоследняя свеча
 
+            # --- НОВЫЙ БЛОК: Фильтрация сигналов с помощью ML-модели ---
+            ml_bundle = params.get('ml_model_bundle')
+            if ml_bundle and params.get('use_ml_filter'):
+                model = ml_bundle['model']
+                scaler = ml_bundle['scaler']
+                feature_names = ml_bundle['feature_names']
+                numerical_features = ml_bundle['numerical_features']
+                categorical_features = ml_bundle.get('categorical_features', [])
+
+                # Извлекаем признаки для текущего сигнала из обогащенного DataFrame
+                signal_features = df_with_features.loc[[analysis_idx]][feature_names]
+                
+                features_for_prediction = signal_features.copy()
+                
+                # --- ИСПРАВЛЕНИЕ: Корректно масштабируем признаки перед предсказанием ---
+                # 1. Масштабируем только числовые признаки
+                num_features_in_df = [f for f in numerical_features if f in features_for_prediction.columns]
+                if scaler and num_features_in_df:
+                    features_for_prediction[num_features_in_df] = scaler.transform(features_for_prediction[num_features_in_df])
+                # 2. Приводим категориальные признаки к нужному типу (если они есть)
+                for col in categorical_features:
+                    if col in features_for_prediction.columns:
+                        features_for_prediction[col] = features_for_prediction[col].astype(int)
+                
+                # Предсказываем вероятность "успешного" сигнала
+                prediction = model.predict(features_for_prediction[feature_names])
+                if prediction[0] == 0: # Если модель предсказывает провал (0)
+                    # --- НОВЫЙ БЛОК: Симулируем пропущенную сделку для анализа ---
+                    # Это нужно, чтобы потом можно было посмотреть, от каких сделок модель отказалась.
+                    
+                    # 1. Ищем потенциальный вход (та же логика, что и для реальных сделок)
+                    temp_base_price = open_prices[analysis_idx + 1]
+                    temp_long_level = temp_base_price * (1 + bracket_offset_pct / 100)
+                    temp_short_level = temp_base_price * (1 - bracket_offset_pct / 100)
+                    temp_use_hldir = params.get("use_hldir_on_conflict", True)
+                    temp_simulate_slippage = params.get("simulate_slippage", True)
+
+                    temp_entry_idx, temp_entry_price, temp_direction_str = find_bracket_entry(
+                        start_idx=analysis_idx + 1, timeout=bracket_timeout_candles,
+                        long_level=temp_long_level, short_level=temp_short_level,
+                        use_hldir_on_conflict=temp_use_hldir, simulate_slippage=temp_simulate_slippage,
+                        hldir_values=hldir_values, high_prices=high_prices,
+                        low_prices=low_prices, open_prices=open_prices
+                    )
+
+                    if temp_direction_str != "none":
+                        # 2. Если вход был бы, ищем потенциальный выход
+                        temp_sl, temp_tp = self.calculate_stop_loss_take_profit(temp_entry_price, temp_direction_str)
+                        temp_exit_idx, temp_exit_reason, temp_exit_price = find_first_exit(
+                            entry_idx=temp_entry_idx, direction_is_long=(temp_direction_str == 'long'),
+                            stop_loss=temp_sl, take_profit=temp_tp,
+                            high_prices=high_prices, low_prices=low_prices, close_prices=close_prices
+                        )
+
+                        # 3. Сохраняем "виртуальную" сделку
+                        skipped_trade = {
+                            'entry_idx': temp_entry_idx, 'entry_price': temp_entry_price,
+                            'direction': temp_direction_str, 'stop_loss': temp_sl, 'take_profit': temp_tp,
+                            'exit_idx': int(temp_exit_idx), 'exit_price': temp_exit_price,
+                            'exit_reason': temp_exit_reason, 'signal_idx_for_trade': analysis_idx,
+                            'pnl': 0, # PnL не считаем, т.к. сделки не было
+                            'skipped_by_ml': True # Флаг, что сделка пропущена
+                        }
+                        self.trades.append(skipped_trade) # Добавляем в основной список сделок
+
+                    # Пропускаем этот сигнал и переходим к следующему
+                    continue # Пропускаем этот сигнал
+            # --- Конец блока ML-фильтрации ---
+
             direction = None
             entry_idx = -1
             entry_price = -1
 
-            # --- ПРОВЕРКА СИГНАЛА МОДЕЛЬЮ (если модель есть) ---
-            if model:
-                ml_features_for_trade = None # type: ignore
-                # Подготавливаем признаки для текущего сигнала
-                current_features = feature_df.loc[[analysis_idx]]
-                current_features_scaled = scaler.transform(current_features)
-                
-                # Предсказываем класс (1 - хороший long, 0 - плохой)
-                prediction = model.predict(current_features_scaled)[0]
-                if prediction != 1:
-                    current_idx = analysis_idx # Сдвигаем индекс
-                    self.ml_rejected_signals.append(analysis_idx)
-                    continue # Сигнал отфильтрован моделью, переходим к следующему
-                else:
-                    # Если сигнал одобрен, сохраняем его признаки для отображения на графике
-                    ml_features_for_trade = current_features.iloc[0].to_dict()
-
-            # --- ИСПРАВЛЕНИЕ: Базовая цена для "вилки" - это цена открытия СЛЕДУЮЩЕЙ свечи ---
-            # Это более реалистично, так как сигнал появляется после закрытия свечи `analysis_idx`.
-            base_price = open_prices[analysis_idx + 1]
+            # --- ИСПРАВЛЕНИЕ: Базовая цена для "вилки" - это цена открытия СЛЕДУЮЩЕЙ свечи, а не закрытия сигнальной ---
+            # Это более реалистично, так как сигнал появляется после закрытия свечи `analysis_idx`, а ордера выставляются относительно открытия следующей.
+            base_price = open_prices[analysis_idx + 1] # Используем open следующей свечи
             long_level = base_price * (1 + bracket_offset_pct / 100) # type: ignore
             short_level = base_price * (1 - bracket_offset_pct / 100) # type: ignore
 
+            use_hldir_on_conflict_flag = params.get("use_hldir_on_conflict", True)
+            simulate_slippage_flag = params.get("simulate_slippage", True)
             # Ищем вход в "вилке"
             entry_idx, entry_price, direction_str = find_bracket_entry(
                 start_idx=analysis_idx + 1,
                 timeout=bracket_timeout_candles,
                 long_level=long_level,
                 short_level=short_level,
+                use_hldir_on_conflict=use_hldir_on_conflict_flag,
+                simulate_slippage=simulate_slippage_flag,
+                hldir_values=hldir_values,
                 high_prices=high_prices,
-                low_prices=low_prices,
-                open_prices=open_prices,
-                hldir_values=hldir_values
+                low_prices=low_prices, # type: ignore
+                open_prices=open_prices
             )
             # Направление и цена входа уже определены функцией find_bracket_entry
             direction = direction_str if direction_str != "none" else None
             # Добавляем параметры в used_params только если вход по вилке состоялся
             if direction:
+                if use_hldir_on_conflict_flag:
+                    used_params.add("use_hldir_on_conflict")
+                if simulate_slippage_flag:
+                    used_params.add("simulate_slippage")
                 used_params.update({"bracket_offset_pct", "bracket_timeout_candles"})
+
             # --- Общая логика открытия и закрытия позиции ---
             if direction and entry_idx < len(df):
                 stop_loss, take_profit = self.calculate_stop_loss_take_profit(entry_price, direction)
@@ -342,14 +329,9 @@ class TradingSimulator:
                     direction_is_long=(direction == 'long'),
                     stop_loss=stop_loss,
                     take_profit=take_profit,
-                    use_climax_exit=use_climax_exit,
-                    climax_exit_threshold=climax_exit_threshold,
                     high_prices=high_prices,
                     low_prices=low_prices,
-                    close_prices=close_prices,
-                    long_climax_scores=long_climax_scores,
-                    short_climax_scores=short_climax_scores,
-                    entry_price=entry_price
+                    close_prices=close_prices
                 )
 
                 if aggressive_mode and exit_idx != -1:
@@ -373,7 +355,7 @@ class TradingSimulator:
                         'exit_price': exit_price,
                         'exit_reason': exit_reason,
                         'signal_idx_for_trade': analysis_idx, # Индекс сигнальной свечи
-                        'ml_features': ml_features_for_trade if model and ml_features_for_trade is not None else None # Признаки, использованные моделью
+                        'ml_features': None
                     }
                     self.trades.append(trade)
                     current_idx = trade['exit_idx']
@@ -387,7 +369,12 @@ class TradingSimulator:
         # --- Конец векторизованной логики ---
 
         # Рассчитываем PnL для всех сделок после цикла
-        for trade in self.trades:
+        # --- ИЗМЕНЕНИЕ: Отделяем реальные сделки от пропущенных для расчета PnL ---
+        real_trades = [t for t in self.trades if not t.get('skipped_by_ml')]
+        skipped_trades = [t for t in self.trades if t.get('skipped_by_ml')]
+
+        # PnL и баланс считаем только для реальных сделок
+        for trade in real_trades: # --- ИСПРАВЛЕНИЕ: Итерируемся только по реальным сделкам ---
             if trade['direction'] == 'long':
                 pnl = (trade['exit_price'] - trade['entry_price']) / trade['entry_price']
             else: # short
@@ -396,13 +383,12 @@ class TradingSimulator:
             pnl_amount = self.position_size * pnl - (self.position_size * self.commission) * 2
             trade['pnl'] = pnl_amount
             self.pnl_history.append(pnl_amount)
-            
-            balance_value = self.initial_balance + pnl_amount if len(self.balance_history) == 0 else self.balance_history[-1] + pnl_amount
+            balance_value = self.initial_balance + pnl_amount if not self.balance_history else self.balance_history[-1] + pnl_amount
             self.balance_history.append(balance_value)
 
-        return self.calculate_metrics(used_params, feature_importances, model, scaler, feature_df)
+        return self.calculate_metrics(used_params)
 
-    def calculate_metrics(self, used_params=None, feature_importances=None, model=None, scaler=None, feature_df=None):
+    def calculate_metrics(self, used_params=None):
         """Вычисляет итоговые метрики после симуляции."""
         # Рассчитываем метрики с использованием векторизованных операций
         if self.pnl_history:            
@@ -427,6 +413,8 @@ class TradingSimulator:
             drawdowns = (running_max - balance_array) / running_max
             max_drawdown = np.max(drawdowns) if len(drawdowns) > 0 else 0
         else:
+            pnl_array = np.array([]) # <--- ИСПРАВЛЕНИЕ: Инициализируем pnl_array как пустой массив
+            # Если нет сделок, все метрики равны 0
             total_trades = 0
             winning_trades = 0
             win_rate = 0
@@ -434,10 +422,49 @@ class TradingSimulator:
             avg_pnl = 0
             profit_factor = 0
             max_drawdown = 0
+            sharpe_ratio = 0.0
+            sortino_ratio = 0.0
+            expectancy = 0.0
+            avg_pnl_per_trade = 0.0
+        
+        # Calculate Sharpe Ratio
+        # Assuming risk-free rate is 0 and 252 trading days for annualization
+        if len(pnl_array) >= 2 and pnl_array.std() != 0:
+            sharpe_ratio = pnl_array.mean() / pnl_array.std() * np.sqrt(252)
+        else:
+            sharpe_ratio = 0.0
+
+        # Calculate Sortino Ratio
+        negative_pnl = pnl_array[pnl_array < 0]
+        if len(negative_pnl) >= 2 and negative_pnl.std() != 0:
+            sortino_ratio = pnl_array.mean() / negative_pnl.std() * np.sqrt(252)
+        else:
+            sortino_ratio = 0.0
+        
+        # Calculate Expectancy
+        if total_trades > 0:
+            avg_win = profits.mean() if len(profits) > 0 else 0.0
+            avg_loss = losses.mean() if len(losses) > 0 else 0.0
+            loss_rate = (total_trades - winning_trades) / total_trades
+            expectancy = (avg_win * win_rate) - (avg_loss * loss_rate)
+            avg_pnl_per_trade = total_pnl / total_trades
+        else:
+            profits = np.array([]) # Инициализируем, чтобы избежать ошибок ниже
+            total_trades = 0
+            winning_trades = 0
+            win_rate = 0
+            total_pnl = 0
+            avg_pnl = 0
+            profit_factor = 0
+            max_drawdown = 0
+            sharpe_ratio = 0.0
+            sortino_ratio = 0.0
+            expectancy = 0.0
+            avg_pnl_per_trade = 0.0
         
         # Обеспечиваем, что все значения в результатах являются обычными Python или NumPy значениями
         results = {
-           'total_signals': int(self.total_signals),
+           'total_signals': self.total_signals if hasattr(self, 'total_signals') else 0,
             'total_trades': int(total_trades),
             'winning_trades': int(winning_trades),
             'win_rate': float(win_rate),
@@ -445,21 +472,23 @@ class TradingSimulator:
             'avg_pnl': float(avg_pnl),
             'max_drawdown': float(max_drawdown),
             'profit_factor': float(profit_factor),
+            'sharpe_ratio': float(sharpe_ratio), # NEW
+            'sortino_ratio': float(sortino_ratio), # NEW
+            'expectancy': float(expectancy), # NEW
+            'avg_pnl_per_trade': float(avg_pnl_per_trade), # NEW
             'trades': self.trades,
             'pnl_history': self.pnl_history,
             'balance_history': self.balance_history,
             'final_balance': self.balance_history[-1] if self.balance_history else self.initial_balance,
-            'used_params': list(used_params) if used_params else [],
-            'feature_importances': feature_importances,
-            'ml_rejected_signals': self.ml_rejected_signals,
+            'used_params': list(used_params) if used_params else [],            
             # --- ИСПРАВЛЕНИЕ: Удаляем несериализуемые объекты ---
             # Эти объекты (модель, скейлер, датафрейм) не могут быть сохранены в JSON.
             # Они будут заново созданы на странице "Анализ" при необходимости.
             'ml_model': None, # Явно устанавливаем в None
             'ml_scaler': None,
             'ml_features_df': None
-        }
-        results['is_ml_simulation'] = bool(model)
+        }        
+        results['is_ml_simulation'] = False
         
         return results
 
@@ -469,14 +498,9 @@ def find_first_exit(
     direction_is_long: bool,
     stop_loss: float,
     take_profit: float,
-    use_climax_exit: bool,
-    climax_exit_threshold: float,
     high_prices: np.ndarray,
     low_prices: np.ndarray,
-    close_prices: np.ndarray,
-    long_climax_scores: np.ndarray,
-    short_climax_scores: np.ndarray,
-    entry_price: float
+    close_prices: np.ndarray
 ):
     """
     Numba-ускоренная функция для поиска первой точки выхода.
@@ -495,17 +519,6 @@ def find_first_exit(
             if low_prices[i] <= take_profit:
                 return i, 'take_profit', take_profit
 
-        # Проверка выхода по Climax Score
-        if use_climax_exit:
-            if direction_is_long:
-                # Выход только если цена выше цены входа (в прибыли)
-                if long_climax_scores[i] > climax_exit_threshold and close_prices[i] > entry_price:
-                    return i, 'climax_exit', close_prices[i]
-            else: # short
-                # Выход только если цена ниже цены входа (в прибыли)
-                if short_climax_scores[i] > climax_exit_threshold and close_prices[i] < entry_price:
-                    return i, 'climax_exit', close_prices[i]
-
     return len(high_prices) - 1, 'end_of_data', close_prices[-1]
 
 @numba.jit(nopython=True, cache=True)
@@ -514,10 +527,12 @@ def find_bracket_entry(
     timeout: int,
     long_level: float,
     short_level: float,
+    simulate_slippage: bool,
+    use_hldir_on_conflict: bool,
+    hldir_values: np.ndarray,
     high_prices: np.ndarray,
     low_prices: np.ndarray,
-    open_prices: np.ndarray,
-    hldir_values: np.ndarray
+    open_prices: np.ndarray
 ):
     """
     Numba-ускоренная функция для поиска первого входа по "вилке".
@@ -533,27 +548,41 @@ def find_bracket_entry(
         # Случай 1: Однозначный пробой в одну сторону
         if hit_long and not hit_short:
             # Вход по long. Если open > long_level, то это проскальзывание.
-            entry_price = max(long_level, open_prices[i])
+            if simulate_slippage:
+                entry_price = max(long_level, open_prices[i])
+            else:
+                entry_price = long_level
             return i, entry_price, "long"
         
         if hit_short and not hit_long:
             # Вход по short. Если open < short_level, то это проскальзывание.
-            entry_price = min(short_level, open_prices[i])
+            if simulate_slippage:
+                entry_price = min(short_level, open_prices[i])
+            else:
+                entry_price = short_level
             return i, entry_price, "short"
 
         # Случай 2: Неоднозначный пробой в обе стороны за одну свечу
         if hit_long and hit_short:
-            # Используем HLdir для принятия решения
-            if hldir_values[i] == 1: # Если HLdir указывает на силу покупателей
-                entry_price = max(long_level, open_prices[i])
-                return i, entry_price, "long"
-            else: # Если HLdir == 0, указывает на силу продавцов
-                entry_price = min(short_level, open_prices[i])
-                return i, entry_price, "short"
+            # Если опция использования HLdir включена
+            if use_hldir_on_conflict:
+                if hldir_values[i] == 1:  # HLdir = 1 указывает на лонг
+                    if simulate_slippage:
+                        entry_price = max(long_level, open_prices[i])
+                    else:
+                        entry_price = long_level
+                    return i, entry_price, "long"
+                elif hldir_values[i] == 0:  # HLdir = 0 указывает на шорт
+                    if simulate_slippage:
+                        entry_price = min(short_level, open_prices[i])
+                    else:
+                        entry_price = short_level
+                    return i, entry_price, "short"
+            return -1, -1.0, "none"
 
-    return -1, -1.0, "none" # Тайм-аут или одновременный пробой
+    return -1, -1.0, "none" # Тайм-аут
 
-def run_grouped_trading_simulation(df, params, screening_mode=False):
+def run_grouped_trading_simulation(df, params):
     """
     Запускает симуляцию для DataFrame с несколькими инструментами,
     группируя по 'Symbol' и агрегируя результаты.
@@ -564,14 +593,14 @@ def run_grouped_trading_simulation(df, params, screening_mode=False):
         group_df_reset = group_df.reset_index(drop=True)
         
         # Запускаем симуляцию для одного инструмента
-        result = run_trading_simulation(group_df_reset, params, screening_mode)
+        result = run_trading_simulation(group_df_reset, params)
         
         # Корректируем индексы сделок, чтобы они соответствовали исходному `group_df`
         original_indices = group_df.index
         for trade in result['trades']:
             trade['entry_idx'] = original_indices[trade['entry_idx']]
             trade['exit_idx'] = original_indices[trade['exit_idx']]
-            trade['signal_idx'] = original_indices[trade['signal_idx']]
+            trade['signal_idx_for_trade'] = original_indices[trade['signal_idx_for_trade']]
         
         all_results.append(result)
 
@@ -623,7 +652,7 @@ def run_grouped_trading_simulation(df, params, screening_mode=False):
     }
     return results
 
-def run_trading_simulation(df, params, screening_mode=False):
+def run_trading_simulation(df, params):
 
 
     """
@@ -636,10 +665,6 @@ def run_trading_simulation(df, params, screening_mode=False):
     Returns:
         результаты симуляции
     """
-    # print("\n--- Запуск симуляции со следующими параметрами: ---")
-    # pprint.pprint(params)
-    # print("---------------------------------------------------\n")
- 
     # Создаем копию, чтобы не изменять оригинальный словарь параметров, который может использоваться в Optuna
     params_copy = params.copy()
 
@@ -654,32 +679,20 @@ def run_trading_simulation(df, params, screening_mode=False):
     # Новые параметры для "вилки"
     params_copy["bracket_offset_pct"] = round(params_copy.get("bracket_offset_pct", 0.5), 2)
     params_copy["bracket_timeout_candles"] = int(params_copy.get("bracket_timeout_candles", 5))
-    
-    # --- КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Явное добавление всех ML-параметров ---
-    # Явно добавляем все ML-параметры (как для признаков, так и для классификатора) в `params_copy` из `params`.
-    # Это гарантирует, что и `generate_signals`, и `train_ml_model` внутри симулятора получат все необходимые данные,
-    # особенно при запуске со страницы "Анализ" после загрузки профиля из "Аналитики".
-    ml_feature_keys = [
-        "classifier_type", "catboost_iterations", "catboost_depth", "catboost_learning_rate",
-        "prints_analysis_period", "prints_threshold_ratio", "m_analysis_period",
-        "m_threshold_ratio", "hldir_window", "hldir_offset"
-    ]
-    for key in ml_feature_keys:
-        # `params` - это оригинальный словарь, который может содержать ML-параметры,
-        # собранные функцией get_strategy_parameters.
-        if key in params:
-            params_copy[key] = params[key]
 
+    # --- ИСПРАВЛЕНИЕ: Явно передаем флаг использования ML-фильтра в копию параметров ---
+    # Это гарантирует, что симулятор "увидит" этот флаг.
+    params_copy["use_ml_filter"] = params.get("use_ml_filter", False)
+    
     # Создаем симулятор
     simulator = TradingSimulator(
         position_size=position_size,
         commission=commission,
         stop_loss_pct=stop_loss_pct,
         take_profit_pct=take_profit_pct
-        # Всегда используем HLdir, если он присутствует в данных
     )
     
     # Запускаем симуляцию
-    results = simulator.simulate_trades(df, params_copy, aggressive_mode, screening_mode=screening_mode)
+    results = simulator.simulate_trades(df, params_copy, aggressive_mode)
     
     return results

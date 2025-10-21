@@ -2,10 +2,9 @@ streamlit
 pandas
 numpy
 plotly
-scikit-learn
-catboost
 optuna
+scikit-learn
 numba
+catboost
 joblib
-psutil
 pyarrow

@@ -1,9 +1,5 @@
 import optuna
-import pandas as pd
-import pprint
-import threading
 import numpy as np
-from datetime import datetime, date
 import os, joblib
 from joblib import parallel_backend
 from joblib.parallel import ThreadingBackend
@@ -11,13 +7,6 @@ import streamlit as st
 
 # Устанавливаем уровень логирования Optuna. INFO - для отображения проб. WARNING - для "тихого" режима.
 optuna.logging.set_verbosity(optuna.logging.INFO)
-
-
-try:
-    import psutil
-    PSUTIL_AVAILABLE = True
-except ImportError:
-    PSUTIL_AVAILABLE = False
 
 def run_optimization(params):
     """
@@ -29,7 +18,7 @@ def run_optimization(params):
     strategy_func = params['strategy_func']
     seed_params = params.get('seed_params') # Получаем "анкерные" параметры
     target_metric_value = params.get('target_metric_value')
-    backend_choice = params.get('backend_choice', 'threading') # По умолчанию 'threading'
+    backend_choice = params.get('backend_choice', 'loky') # По умолчанию 'loky'
 
     # Флаг для остановки
     stop_file = 'stop_optimization.flag'
@@ -58,21 +47,6 @@ def run_optimization(params):
                 elif param_type == "categorical":
                     choices = value_tuple[1]
                     suggested_params[name] = current_trial.suggest_categorical(name, choices)
-                elif param_type == "conditional":
-                    # value_tuple: ("conditional", conditional_param_name, conditional_param_space)
-                    _, conditional_param_name, conditional_param_space = value_tuple
-                    # Убедимся, что условный параметр уже был предложен
-                    if conditional_param_name in suggested_params:
-                        chosen_value = suggested_params[conditional_param_name]
-                        # Если для выбранного значения есть свое пространство параметров, предлагаем их
-                        if chosen_value in conditional_param_space:
-                            nested_params = suggest_params_recursively(conditional_param_space[chosen_value], current_trial)
-                            suggested_params.update(nested_params)
-                    else:
-                        # Это может произойти, если 'conditional' определен до 'categorical' в словаре
-                        # В Python 3.7+ порядок ключей словаря сохраняется, но лучше располагать 'categorical' раньше.
-                        st.warning(f"Условный параметр '{name}' определен до его зависимости '{conditional_param_name}'. "
-                                   f"Убедитесь, что зависимость '{conditional_param_name}' идет первой в param_space.")
             return suggested_params
 
         trial_params = suggest_params_recursively(param_space, trial)
@@ -81,17 +55,10 @@ def run_optimization(params):
         # Базовые настройки (position_size, commission и т.д.) теперь передаются явно
         full_params = {**params.get('base_settings', {}), **trial_params}
 
-        # print(f"\n--- Optuna Trial #{trial.number} с параметрами: ---")
-        # pprint.pprint(full_params)
-        # print("---------------------------------------------------\n")
- 
         # Запускаем целевую функцию
         try:
             # strategy_func теперь может возвращать кортеж (метрики, результаты_симуляции)
-            # Проверяем, есть ли в данных колонки для скрининга. Если да, включаем screening_mode.
-            # Используем флаг, переданный из WFO, чтобы контролировать, когда включать скрининг.
-            use_screening_for_this_run = params.get('screening_mode_on_train', False) and 'promising_long' in data.columns
-            result = strategy_func(data, full_params, screening_mode=use_screening_for_this_run)
+            result = strategy_func(data, full_params)
             sim_results = {}
             if isinstance(result, tuple) and len(result) == 2:
                 metric, sim_results = result
@@ -114,7 +81,10 @@ def run_optimization(params):
                 "error": str(e)
             })
             # Возвращаем худшее значение, чтобы Optuna знала, что это плохой результат
-            return (-1000.0, -1.0) if is_multi_objective else -1000.0
+            # Использование TrialPruned - более идиоматичный способ сообщить Optuna о неудаче.
+            # Это позволяет Optuna лучше обрабатывать такие случаи, например, в TPE-сэмплере.
+            # return (-1000.0, -1.0) if is_multi_objective else -1000.0
+            raise optuna.exceptions.TrialPruned(f"Ошибка в пробе: {str(e)}")
 
         # Проверка на достижение цели
         if target_metric_value is not None:
@@ -125,7 +95,10 @@ def run_optimization(params):
         # Если метрика является штрафом, сохраняем причину для отладки
         if sim_results: # sim_results будет пустым, если была ошибка
             if (is_multi_objective and metric[0] < 0) or (not is_multi_objective and metric < 0):
-                trial.set_user_attr("reason_for_penalty", f"Недостаточно сделок или убыточность. Trades: {sim_results.get('total_trades', 'N/A')}, PnL: {sim_results.get('total_pnl', 'N/A'):.2f}")
+                # --- ИСПРАВЛЕНИЕ: Безопасное форматирование PnL ---
+                pnl_value = sim_results.get('total_pnl', 'N/A')
+                pnl_str = f"{pnl_value:.2f}" if isinstance(pnl_value, (int, float)) else str(pnl_value)
+                trial.set_user_attr("reason_for_penalty", f"Недостаточно сделок или убыточность. Trades: {sim_results.get('total_trades', 'N/A')}, PnL: {pnl_str}")
 
         return metric
 
@@ -139,8 +112,10 @@ def run_optimization(params):
     # В противном случае, используем все ядра.
     n_jobs = params.get('n_jobs', os.cpu_count() or 1)
 
-    st.info(f"Запуск Optuna оптимизации с {n_trials} пробами на {n_jobs} ядрах. Это может занять некоторое время...")
-    st.info(f"Используется бэкенд для параллелизма: **{backend_choice}**")
+    # Заменяем st.info на print, чтобы избежать вызова UI-функций из потенциально фоновых потоков (например, в WFO).
+    # Основной UI (спиннер) будет отображаться на странице optimization_page.
+    print(f"Запуск Optuna оптимизации с {n_trials} пробами на {n_jobs} ядрах. Бэкенд: {backend_choice}")
+
     study = optuna.create_study(directions=direction if is_multi_objective else [direction])
 
     # --- Новая логика: добавляем "анкерную" пробу, если она предоставлена ---
@@ -153,25 +128,15 @@ def run_optimization(params):
             # Не выводим сообщение в Streamlit, чтобы не засорять лог WFO
             print(f"Info: Enqueued seed trial for Optuna study with params: {valid_seed_params}")
         except Exception as e:
-            st.warning(f"Не удалось добавить анкерную пробу: {e}")
+            print(f"Warning: Не удалось добавить анкерную пробу: {e}")
 
     try:
-        if backend_choice == 'threading':
-            # 'threading' имеет меньшие накладные расходы, идеально для быстрых вычислений с Numba.
-            # Явное создание экземпляра решает проблему с замедлением при повторных запусках в Streamlit,
-            # гарантируя создание нового, чистого пула потоков для каждого вызова.
-            backend = ThreadingBackend(inner_max_num_threads=n_jobs)
-        else: # 'loky'
-            # 'loky' использует процессы, что обеспечивает лучшую изоляцию и надежность,
-            # но имеет более высокие накладные расходы.
-            # Для 'loky' не требуется специальная обработка, как для ThreadingBackend.
-            backend = 'loky'
-
-        with parallel_backend(backend):
+        # Используем 'loky' по умолчанию. Он более надежен в среде Streamlit, так как использует процессы.
+        with parallel_backend('loky'):
             study.optimize(objective, n_trials=n_trials, n_jobs=n_jobs)
 
     except optuna.exceptions.TrialPruned:
-        st.warning("Оптимизация была остановлена.")
+        print("Оптимизация была остановлена (возможно, пользователем или из-за ошибки в пробе).")
 
     if os.path.exists(stop_file):
         os.remove(stop_file)
@@ -199,10 +164,11 @@ def run_optimization(params):
             result_entry['value'] = t.values
             # Добавляем сохраненные метрики
             for key, value in t.user_attrs.items():
-                # Форматируем PnL для лучшего отображения
+                # --- ИСПРАВЛЕНИЕ: Безопасное форматирование PnL ---
                 if 'pnl' in key.lower() and isinstance(value, (int, float)):
                     result_entry[key] = f"${value:.2f}"
-                result_entry[key] = value
+                else:
+                    result_entry[key] = value
             top_10_results.append(result_entry)
 
     else: # Single objective
@@ -222,10 +188,11 @@ def run_optimization(params):
                 result_entry['value'] = t.value
                 # Добавляем сохраненные метрики
                 for key, value in t.user_attrs.items():
-                    # Форматируем PnL для лучшего отображения
+                    # --- ИСПРАВЛЕНИЕ: Безопасное форматирование PnL ---
                     if 'pnl' in key.lower() and isinstance(value, (int, float)):
                         result_entry[key] = f"${value:.2f}"
-                    result_entry[key] = value
+                    else:
+                        result_entry[key] = value
                 top_10_results.append(result_entry)
 
     return {
@@ -234,31 +201,6 @@ def run_optimization(params):
         'top_10_results': top_10_results,        
         'study': study,
     }
-
-def _flatten_conditional_params(params: dict) -> dict:
-    """
-    Упрощает словарь параметров, "схлопывая" условные параметры в одну колонку.
-    Например: {'classifier_type': 'RandomForest', 'rf_n_estimators': 100}
-    превращается в {'classifier_type': 'RandomForest', 'classifier_details': {'n_estimators': 100}}
-    """
-    classifier_type = params.get('classifier_type')
-    if not classifier_type:
-        return params
-
-    # Определяем префикс для поиска параметров. CatBoost не имеет верхнего регистра в названии.
-    prefix = classifier_type.lower() + '_'
-
-    details = {k.replace(prefix, ''): v for k, v in params.items() if k.startswith(prefix)}
-
-    if not details:
-        return params
-
-    # Удаляем исходные ключи и добавляем новый
-    params_to_remove = [k for k in params if k.startswith(prefix)]
-    for k in params_to_remove:
-        del params[k]
-    params['classifier_details'] = str(details) # Преобразуем в строку для DataFrame
-    return params
 
 def run_iterative_optimization(params):
     """
@@ -325,29 +267,4 @@ def run_iterative_optimization(params):
     
     final_results = run_optimization(params)
 
-    # Улучшаем читаемость результатов, если они есть
-    if final_results and 'top_10_results' in final_results:
-        final_results['top_10_results'] = [_flatten_conditional_params(res) for res in final_results['top_10_results']]
-        if 'best_params' in final_results:
-            # Не изменяем best_params, так как они нужны для повторного запуска
-            pass
-
     return final_results
-
-def objective_wrapper(data, params, screening_mode=False):
-    """
-    Обертка для целевой функции, которая передает `screening_mode` в симулятор.
-    """
-    # Запускаем симуляцию с учетом режима скрининга
-    results = run_trading_simulation(data, params, screening_mode=screening_mode)
-
-    # Далее логика из `trading_strategy_objective_sqn`
-    total_trades = results.get('total_trades', 0)
-    if total_trades < 25: # min_trades_threshold
-        return -100.0 + total_trades, results
-
-    # ... (остальная логика расчета SQN, как в strategy_objectives.py)
-    # Этот пример упрощен. В реальном коде нужно будет передавать `screening_mode`
-    # через все слои до `run_trading_simulation`.
-    # В нашем случае, мы уже изменили `run_optimization` для этого.
-    pass

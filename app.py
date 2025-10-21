@@ -16,7 +16,6 @@ from ui.optimization_page import show_optimization_page
 from app_utils import load_profile_to_session_state
 
 # Импортируем бэкенд модули
-import wfo_optimizer # Импортируем новый модуль WFO
 import optuna_optimizer as wfo_optuna # Импортируем модуль оптимизации
 import strategy_objectives # Импортируем модуль с дополнительными целевыми функциями
 # Настройка страницы
@@ -30,6 +29,7 @@ st.set_page_config(
 os.makedirs("profiles", exist_ok=True)
 os.makedirs("plots", exist_ok=True) # Директория для графиков
 os.makedirs("optimization_runs", exist_ok=True)
+os.makedirs("wfo_reports", exist_ok=True) # Директория для HTML-отчетов WFO
 
 # Заголовок приложения
 st.title("📈 Streamlit Backtester")
@@ -147,6 +147,32 @@ elif current_page == "Аналитика":
     # Локальный импорт, чтобы избежать циклической зависимости
     from app_utils import get_optimization_run_files, load_run_data_cached
     
+    # --- НОВЫЙ БЛОК: Отображение сохраненных HTML-отчетов WFO ---
+    st.subheader("Сохранённые HTML-отчеты WFO")
+    report_dir = "wfo_reports"
+    try:
+        report_files = sorted(
+            [f for f in os.listdir(report_dir) if f.endswith('.html')],
+            reverse=True
+        )
+        if report_files:
+            for report_file in report_files:
+                file_path = os.path.join(report_dir, report_file)
+                with open(file_path, "rb") as fp:
+                    st.download_button(
+                        label=f"📄 {report_file}",
+                        data=fp,
+                        file_name=report_file,
+                        mime="text/html",
+                        key=f"download_{report_file}"
+                    )
+        else:
+            st.info("Нет сохраненных HTML-отчетов WFO.")
+    except FileNotFoundError:
+        st.info("Директория для отчетов 'wfo_reports' не найдена.")
+    st.markdown("---")
+    # --- КОНЕЦ НОВОГО БЛОКА ---
+
     run_files = get_optimization_run_files()
     
     if run_files:
@@ -265,94 +291,76 @@ elif current_page == "Аналитика":
                     # --- Конец блока кнопок и метрик ---
 
                     # Переупорядочиваем столбцы в соответствии с порядком в результатах оптимизации
+                    # Сначала ключевые метрики производительности
                     desired_order = [
                         "ID",
-                        "Total Trades", "PnL", "Win Rate", "Max Drawdown", "Sharpe Ratio", "Profit Factor",
+                        "value", # Целевая метрика Optuna
+                        "total_pnl", "total_trades", "win_rate", "max_drawdown", "profit_factor",
+                        # Добавляем метрики, которые могут иметь другие названия
+                        "PnL", "Total Trades", "Win Rate", "Max Drawdown", "Profit Factor", "SQN",
+                        # Затем параметры стратегии
                         "vol_pctl", "vol_period", "rng_pctl", "range_period", "natr_min", "natr_period",
                         "min_growth_pct", "lookback_period", "prints_analysis_period", "prints_threshold_ratio",
-                        "stop_loss_pct", "take_profit_pct"
+                        "stop_loss_pct", "take_profit_pct",
+                        "bracket_offset_pct", "bracket_timeout_candles"
                     ]
-                    # Добавляем параметры "вилки", если они могут быть в результатах
-                    desired_order.extend(["bracket_offset_pct", "bracket_timeout_candles"])
                     
                     # Убедимся, что все столбцы из desired_order присутствуют в DataFrame
                     available_columns = [col for col in desired_order if col in results_df.columns]
-                    # Добавим любые столбцы, которые могут отсутствовать в desired_order, в конец, кроме 'value'
-                    additional_columns = [col for col in results_df.columns if col not in desired_order]
+                    
+                    # Добавляем остальные столбцы, которые не были в `desired_order`, в конец.
+                    # Это гарантирует, что ни один столбец не будет потерян.
+                    # `dict.fromkeys` используется для сохранения уникальности и порядка.
+                    additional_columns = [col for col in results_df.columns if col not in available_columns]
                     final_order = available_columns + additional_columns
                     
-                    results_df_display = results_df[final_order].copy()
+                    results_df_display = results_df[final_order]
                     
                     # Отображаем параметры (все результаты теперь используют режим 1)
                     display_df = results_df_display.copy()
+
+                    # --- Форматирование столбцов в проценты для наглядности ---
+                    percent_columns = ['max_drawdown', 'Max Drawdown', 'win_rate', 'Win Rate']
+                    for col_name in percent_columns:
+                        if col_name in display_df.columns:
+                            # Применяем форматирование, обрабатывая возможные ошибки и пропуски
+                            display_df[col_name] = display_df[col_name].apply(
+                                lambda x: f"{x * 100:.2f}%" if isinstance(x, (int, float)) and pd.notnull(x) else x
+                            )
+                    # --- Конец блока форматирования ---
+
+
                     
                     # Добавляем колонку с кнопками для выбора результата
                     selected_result_key = f"selected_result_{run_name}"
-                    # Добавляем еще одну колонку для кнопки "Графики"
-                    cols = st.columns([1, 1, 8])  # Колонки для кнопок "В анализ", "Графики" и основной таблицы
-                    with cols[0]:
-                        st.write("**В анализ**")
-                        for i in range(len(results_df)):
-                            # Получаем информацию о результате для отображения на кнопке
+                    
+                    # Создаем кнопки для перехода в анализ в одну строку
+                    st.write("**Перейти в анализ с параметрами:**")
+                    # Создаем до 10 колонок для кнопок
+                    button_cols = st.columns(min(len(results_df), 10)) 
+                    for i, col in enumerate(button_cols):
+                        with col:
                             result_row = results_df.iloc[i]
-                            result_id = result_row.get('ID', i+1)
-                            # Убираем PnL и WR с кнопки для компактности
-                            pnl = result_row.get('PnL', 'N/A')
-                            win_rate = result_row.get('Win Rate', 'N/A')
-                            
-                            # Кнопка с информацией о результате (только значения), которая сразу переходит в анализ
-                            if st.button(f"Парам. {result_id}", key=f"select_{run_name}_result_{i}", help="Загрузить параметры этого результата на страницу 'Анализ'"):
-                                # Загружаем параметры выбранного результата в session_state с правильными ключами
+                            result_id = result_row.get('ID', i + 1)
+                            if st.button(f"{result_id}", key=f"select_{run_name}_result_{i}", help=f"Загрузить параметры результата {result_id} на страницу 'Анализ'"):
                                 selected_params_from_row = {k: v for k, v in result_row.items() if k != 'ID'}
-                                # Собираем все данные: базовые настройки из всего прогона + параметры из строки.
-                                # Параметры из строки (selected_params_from_row) должны иметь приоритет,
-                                # поэтому они идут вторыми при слиянии.
                                 full_params_to_load = {**run_data.get("settings", {}), **selected_params_from_row}
 
                                 # Добавляем файлы данных, использованные в этом прогоне
                                 if "data_files" in run_data:
                                     full_params_to_load["selected_files"] = run_data["data_files"]
                                 
-                                # --- ЛОГИРОВАНИЕ: Выводим передаваемые параметры в консоль ---
-                                import pprint
-                                print(f"\n[LOG] Передача параметров из 'Аналитики' -> 'Анализ' (параметры из строки ID {result_id}):")
-                                pprint.pprint(full_params_to_load)
-                                print("-" * 70)
-                                # --- Конец блока логирования ---
-                                    
                                 load_profile_to_session_state(full_params_to_load, "analysis")
                                 
-                                st.session_state["page"] = "Анализ сигналов"
-                                st.rerun()
-                                
-                    with cols[1]:
-                        st.write("**Графики**")
-                        for i in range(len(results_df)):
-                            result_row = results_df.iloc[i]
-                            result_id = result_row.get('ID', i+1)
-                            # Новая кнопка для генерации графиков
-                            if st.button(f"📊 {result_id}", key=f"plot_{run_name}_result_{i}", help="Перейти в 'Анализ' и автоматически сгенерировать все графики для этого результата"):
-                                # Собираем параметры так же, как и для кнопки "В анализ"
-                                selected_params_from_row = {k: v for k, v in result_row.items() if k != 'ID'}
-                                full_params_to_load = {**run_data.get("settings", {}), **selected_params_from_row}
+                                # Добавляем флаг для автоматической генерации графиков
+                                st.session_state['run_analysis_and_plot'] = True
 
-                                if "data_files" in run_data:
-                                    full_params_to_load["selected_files"] = run_data["data_files"]
-
-                                # --- КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: Добавляем флаг для авто-запуска ---
-                                full_params_to_load['run_analysis_and_plot'] = True
-
-                                # Загружаем параметры и флаг в session_state
-                                load_profile_to_session_state(full_params_to_load, "analysis")
-                                
-                                # Переходим на страницу анализа и перезапускаем
                                 st.session_state["page"] = "Анализ сигналов"
                                 st.rerun()
 
-                                
-                    with cols[2]:
-                        # Отображаем таблицу с корректным отображением параметров в зависимости от режима анализа принтов
-                        st.dataframe(display_df, use_container_width=True)
+                    # Отображаем таблицу с результатами
+                    st.dataframe(display_df, use_container_width=True)
+
                 else:
                     st.warning("Нет данных для отображения")
             
