@@ -238,11 +238,12 @@ def trading_strategy_multi_objective_ml(
         # 2. Разметка сигналов для обучения
         X, y = label_all_signals(df_with_features, signal_indices, params)
 
-        if X.empty or y.sum() < 5: # Требуем хотя бы 5 успешных примеров для обучения
+        if X.empty or y.sum() < 4: # Требуем хотя бы 4 успешных примера для обучения
             return (-150.0, -1.0, -1.0), {} # Штраф, если недостаточно данных для обучения
 
         # 3. Обучение ML-модели
-        ml_model_bundle = train_ml_model(X, y, params)
+        model_type = params.get("model_type", "CatBoost") # Получаем тип модели из параметров
+        ml_model_bundle = train_ml_model(X, y, params, model_type=model_type)
 
         # 4. Запуск симуляции с обученной моделью и включенным фильтром
         simulation_params = params.copy()
@@ -302,12 +303,13 @@ def trading_strategy_objective_ml(
         # 2. Разметка сигналов для обучения
         X, y = label_all_signals(df_with_features, signal_indices, params)
 
-        if X.empty or y.sum() < 5: # Требуем хотя бы 5 успешных примеров для обучения
+        if X.empty or y.sum() < 4: # Требуем хотя бы 4 успешных примера для обучения
             return -150.0, {} # Штраф, если недостаточно данных для обучения
 
         # 3. Обучение ML-модели
         # Собираем ML-гиперпараметры из `params`. Если их нет, используются значения по умолчанию.
-        ml_model_bundle = train_ml_model(X, y, params)
+        model_type = params.get("model_type", "CatBoost") # Получаем тип модели из параметров
+        ml_model_bundle = train_ml_model(X, y, params, model_type=model_type)
 
         # 4. Запуск симуляции с обученной моделью и включенным фильтром
         simulation_params = params.copy()
@@ -363,7 +365,7 @@ def trading_strategy_objective_ml_data_quality(
         # Штрафы за недостаточное количество данных
         if num_signals < params.get('min_trades_threshold', 25):
             return -200.0 + num_signals, {"total_signals": num_signals, "positive_labels": num_positive_labels}
-        if num_positive_labels < 5:
+        if num_positive_labels < 4:
             return -150.0 + num_positive_labels, {"total_signals": num_signals, "positive_labels": num_positive_labels}
 
         # 3. Запуск симуляции БЕЗ ML-фильтра для оценки базового SQN
@@ -385,3 +387,58 @@ def trading_strategy_objective_ml_data_quality(
 
     except Exception as e:
         return -500.0, {"error": str(e)}
+
+def trading_strategy_objective_equity_curve_linearity(
+    data: pd.DataFrame,
+    params: Dict[str, Any]
+) -> Tuple[float, Dict[str, Any]]:
+    """
+    Целевая функция, оптимизирующая плавность кривой капитала.
+    Она рассчитывает R-квадрат (коэффициент детерминации) для кривой совокупного PnL.
+    Цель - максимизировать R-квадрат, что соответствует более линейной и плавной кривой.
+
+    Args:
+        data: DataFrame с рыночными данными.
+        params: Словарь с параметрами стратегии.
+
+    Returns:
+        Кортеж ( (R-квадрат), results ).
+    """
+    results = run_trading_simulation(data, params)
+
+    min_trades_threshold = params.get('min_trades_threshold', 25)
+    total_trades = results.get('total_trades', 0)
+    total_pnl = results.get('total_pnl', 0.0)
+    pnl_history = results.get('pnl_history', [])
+
+    # 1. Штрафы за малое количество сделок или убыточность
+    if total_trades < min_trades_threshold:
+        return -2.0 + (total_trades / min_trades_threshold), results
+
+    if total_pnl <= 0:
+        return -1.0, results
+
+    # 2. Расчет R-квадрат для кривой доходности
+    if len(pnl_history) < 2:
+        return 0.0, results # Невозможно рассчитать для одной точки
+
+    # Создаем кривую совокупного PnL
+    equity_curve = np.cumsum(pnl_history)
+    # Создаем ось X (номера сделок)
+    x_axis = np.arange(len(equity_curve))
+
+    # Рассчитываем линейную регрессию (y = a*x + b)
+    # np.polyfit возвращает коэффициенты полинома [a, b]
+    coeffs = np.polyfit(x_axis, equity_curve, 1)
+    slope = coeffs[0]
+
+    # Если наклон отрицательный (тренд вниз), результат плохой
+    if slope < 0:
+        return -1.0, results
+
+    # Рассчитываем R-квадрат
+    correlation_matrix = np.corrcoef(x_axis, equity_curve)
+    correlation_xy = correlation_matrix[0,1]
+    r_squared = correlation_xy**2
+
+    return r_squared, results

@@ -33,6 +33,12 @@ def get_param_space_from_ui():
         "take_profit_pct": ("float", "take_profit_pct_min_optimization", "take_profit_pct_max_optimization"),
         "ml_iterations": ("int", "ml_iterations_min_optimization", "ml_iterations_max_optimization"),
         "ml_depth": ("int", "ml_depth_min_optimization", "ml_depth_max_optimization"),
+        # --- НОВОЕ: Добавляем параметры для MLP ---
+        "ml_epochs": ("int", "ml_epochs_min_optimization", "ml_epochs_max_optimization"),
+        "ml_hidden_size": ("int", "ml_hidden_size_min_optimization", "ml_hidden_size_max_optimization"),
+        "ml_num_hidden_layers": ("int", "ml_num_hidden_layers_min_optimization", "ml_num_hidden_layers_max_optimization"),
+        "ml_batch_size": ("int", "ml_batch_size_min_optimization", "ml_batch_size_max_optimization"),
+        "ml_dropout_rate": ("float", "ml_dropout_rate_min_optimization", "ml_dropout_rate_max_optimization"),
         "ml_learning_rate": ("float", "ml_learning_rate_min_optimization", "ml_learning_rate_max_optimization"),
         "ml_prints_window": ("int", "ml_prints_window_min_optimization", "ml_prints_window_max_optimization"),
         "ml_labeling_timeout_candles": ("int", "ml_labeling_timeout_candles_min_optimization", "ml_labeling_timeout_candles_max_optimization"),
@@ -188,35 +194,69 @@ def show_optimization_page():
         # --- НОВЫЙ БЛОК: Параметры для ML-модели ---
         # Эти виджеты будут отображаться всегда, но использоваться только если выбрана ML-цель
         st.markdown("**🤖 Параметры ML-модели**")
-        ml_param_groups = {
-            "Гиперпараметры CatBoost": [("ml_iterations", "int"), ("ml_depth", "int"), ("ml_learning_rate", "float")],
-            "Параметры признаков и разметки": [("ml_prints_window", "int"), ("ml_labeling_timeout_candles", "int")],
-        }
+
+        # --- НОВЫЙ БЛОК: Выбор типа ML-модели ---
+        ml_model_type_opt = st.radio(
+            "Тип ML-модели для оптимизации",
+            ["CatBoost", "NeuralNetwork"],
+            key="ml_model_type_optimization",
+            horizontal=True,
+            help="Выберите модель, которая будет обучаться и оптимизироваться на каждом шаге WFO или в каждой пробе Optuna."
+        )
+        # --- Конец нового блока ---
+
+        if ml_model_type_opt == "CatBoost":
+            ml_param_groups = {
+                "Гиперпараметры CatBoost": [("ml_iterations", "int"), ("ml_depth", "int"), ("ml_learning_rate", "float")],
+            }
+        elif ml_model_type_opt == "NeuralNetwork":
+            ml_param_groups = {
+                "Гиперпараметры Нейросети": [("ml_epochs", "int"), ("ml_hidden_size", "int"), ("ml_num_hidden_layers", "int"), ("ml_batch_size", "int"), ("ml_dropout_rate", "float"), ("ml_learning_rate", "float")],
+            }
+        else:
+            ml_param_groups = {}
+
+        # Общие параметры для ML
+        ml_param_groups["Параметры признаков и разметки"] = [("ml_prints_window", "int"), ("ml_labeling_timeout_candles", "int")]
+
         for group_name, params_in_group in ml_param_groups.items():
             st.markdown(f"**{group_name}**")
             min_cols = st.columns(len(params_in_group))
             max_cols = st.columns(len(params_in_group))
             
             for i, (param_name, p_type) in enumerate(params_in_group):
-                step = 0.01 if p_type == "float" else 10 if "iterations" in param_name else 1
+                # --- ИСПРАВЛЕНИЕ: Устанавливаем шаг 0.1 для dropout_rate ---
+                if "dropout" in param_name:
+                    step = 0.1
+                elif "learning_rate" in param_name:
+                    step = 0.01
+                else:
+                    step = 10 if "iterations" in param_name else 8 if "size" in param_name or "batch" in param_name else 1
+
                 # --- ИЗМЕНЕНИЕ: Устанавливаем минимальное значение для learning_rate ---
                 if "iterations" in param_name:
                     base_min_val = 10
                 elif "depth" in param_name:
                     base_min_val = 2
                 elif "learning_rate" in param_name:
-                    base_min_val = 0.01
+                    base_min_val = 0.0001 if ml_model_type_opt == "NeuralNetwork" else 0.01
+                elif "dropout_rate" in param_name:
+                    base_min_val = 0.0
+                elif "epochs" in param_name:
+                    base_min_val = 5
+                elif "hidden_size" in param_name or "batch_size" in param_name:
+                    base_min_val = 16
                 else:
                     base_min_val = 1
                 min_value_arg = float(base_min_val) if p_type == "float" else int(base_min_val)
                 
                 with min_cols[i]:
                     min_key = f"{param_name}_min_optimization"
-                    st.number_input(f"{param_name} (min)", key=min_key, value=st.session_state.get(min_key, min_value_arg), step=step, min_value=min_value_arg)
+                    st.number_input(f"{param_name} (min)", key=min_key, value=st.session_state.get(min_key, min_value_arg), step=step, min_value=min_value_arg, format="%.4f" if "learning_rate" in param_name and ml_model_type_opt == "NeuralNetwork" else "%.2f" if p_type == "float" else "%d")
                 
                 with max_cols[i]:
                     max_key = f"{param_name}_max_optimization"
-                    st.number_input(f"{param_name} (max)", key=max_key, value=st.session_state.get(max_key, min_value_arg * 2), step=step, min_value=min_value_arg)
+                    st.number_input(f"{param_name} (max)", key=max_key, value=st.session_state.get(max_key, min_value_arg * 2), step=step, min_value=min_value_arg, format="%.4f" if "learning_rate" in param_name and ml_model_type_opt == "NeuralNetwork" else "%.2f" if p_type == "float" else "%d")
 
 
         col1, col2 = st.columns(2)
@@ -233,9 +273,9 @@ def show_optimization_page():
 
         objective_choice = st.selectbox(
             "Цель оптимизации",
-            options=["SQN (стабильность)", "HFT Score (частота и стабильность)", "Качество данных для ML (для WFO)", "SQN, Max Drawdown и Эффективность сигналов (многоцелевая)", "SQN с ML-фильтром (Optuna)", "SQN, Max Drawdown, Эффективность + ML (многоцелевая)"],
+            options=["SQN (стабильность)", "Плавность Equity (R-квадрат)", "HFT Score (частота и стабильность)", "Качество данных для ML (для WFO)", "SQN, Max Drawdown и Эффективность сигналов (многоцелевая)", "SQN с ML-фильтром (Optuna)", "SQN, Max Drawdown, Эффективность + ML (многоцелевая)"],
             index=2, key="objective_choice",
-            help="SQN - стабильность. HFT Score - для HFT. Качество данных для ML - лучшая цель для WFO с ML-фильтром. Многоцелевая - компромисс. С ML-фильтром (Optuna) - обучает модель на каждой пробе, медленно."
+            help="SQN - стабильность. Плавность Equity - ищет линейный рост. HFT Score - для HFT. Качество данных для ML - лучшая цель для WFO с ML-фильтром. Многоцелевая - компромисс. С ML-фильтром (Optuna) - обучает модель на каждой пробе, медленно."
         )
         is_multi_objective = "многоцелевая" in objective_choice
 
@@ -296,6 +336,8 @@ def show_optimization_page():
                 # Выбор целевой функции в зависимости от выбора пользователя
                 if "SQN" in objective_choice and not is_multi_objective:
                     strategy_objective_func = strategy_objectives.trading_strategy_objective_sqn
+                elif "Плавность Equity" in objective_choice:
+                    strategy_objective_func = strategy_objectives.trading_strategy_objective_equity_curve_linearity
                 elif "HFT" in objective_choice:
                     strategy_objective_func = strategy_objectives.trading_strategy_objective_hft_score
                 elif "Качество данных для ML" in objective_choice:
@@ -456,6 +498,7 @@ def show_optimization_page():
             base_settings = {
                 'position_size': position_size, 'commission': commission,
                 'aggressive_mode': st.session_state.get("aggressive_mode_optimization", False),
+                'model_type': st.session_state.get("ml_model_type_optimization", "CatBoost") # <--- Добавляем тип модели
             }
             opt_params_for_wfo = {
                 'param_space': param_space,
@@ -476,11 +519,26 @@ def show_optimization_page():
             # --- Логика для режима сравнения ---
             st.header("Сравнение WFO: ML-фильтр vs. Baseline")
 
+            # --- ИСПРАВЛЕНИЕ: Выбираем целевую функцию на основе выбора пользователя ---
+            if "SQN" in objective_choice and not is_multi_objective:
+                strategy_objective_func = strategy_objectives.trading_strategy_objective_sqn
+            elif "Плавность Equity" in objective_choice:
+                strategy_objective_func = strategy_objectives.trading_strategy_objective_equity_curve_linearity
+            elif "HFT" in objective_choice:
+                strategy_objective_func = strategy_objectives.trading_strategy_objective_hft_score
+            elif "Качество данных для ML" in objective_choice:
+                strategy_objective_func = strategy_objectives.trading_strategy_objective_ml_data_quality
+            elif "ML" in objective_choice and is_multi_objective:
+                strategy_objective_func = strategy_objectives.trading_strategy_multi_objective_ml
+            elif is_multi_objective:
+                strategy_objective_func = strategy_objectives.trading_strategy_multi_objective
+            else: # По умолчанию, если что-то пошло не так
+                strategy_objective_func = strategy_objectives.trading_strategy_objective_sqn
+
             # --- Запуск 1: WFO с ML-фильтром ---
-            st.subheader("1. Запуск WFO с ML-фильтром (используя цель 'Качество данных для ML')")
+            st.subheader(f"1. Запуск WFO с ML-фильтром (цель: '{objective_choice}')")
             opt_params_ml = opt_params_for_wfo.copy()
-            # Используем специальную цель для поиска лучших данных для ML
-            opt_params_ml['strategy_func'] = strategy_objectives.trading_strategy_objective_ml_data_quality
+            opt_params_ml['strategy_func'] = strategy_objective_func
             # Добавляем флаг, чтобы wfo_optimizer знал, что нужно применить ML
             opt_params_ml['is_ml_wfo'] = True
             results_ml = wfo_optimizer.run_wfo_parallel(combined_df, wfo_params, opt_params_ml)
@@ -490,12 +548,9 @@ def show_optimization_page():
             st.success("Прогон с ML-фильтром завершен.")
 
             # --- Запуск 2: WFO без ML (Baseline) ---
-            st.subheader("2. Запуск WFO без ML-фильтра (Baseline)")
+            st.subheader(f"2. Запуск WFO без ML-фильтра (Baseline, цель: '{objective_choice}')")
             opt_params_no_ml = opt_params_for_wfo.copy()
-            if is_multi_objective:
-                opt_params_no_ml['strategy_func'] = strategy_objectives.trading_strategy_multi_objective
-            else:
-                opt_params_no_ml['strategy_func'] = strategy_objectives.trading_strategy_objective_sqn
+            opt_params_no_ml['strategy_func'] = strategy_objective_func
             results_no_ml = wfo_optimizer.run_wfo_parallel(combined_df, wfo_params, opt_params_no_ml)
             if not results_no_ml or not results_no_ml['summary']:
                 st.error("Прогон WFO без ML-фильтра не дал результатов. Сравнение прервано.")
@@ -582,6 +637,7 @@ def show_optimization_page():
                 'position_size': position_size,
                 'commission': commission,
                 'aggressive_mode': st.session_state.get("aggressive_mode_optimization", False),
+                'model_type': st.session_state.get("ml_model_type_optimization", "CatBoost") # <--- Добавляем тип модели
             }
 
             st.subheader("Результаты оптимизации Optuna")
@@ -589,6 +645,8 @@ def show_optimization_page():
             # Выбор целевой функции в зависимости от выбора пользователя
             if "SQN" in objective_choice and not is_multi_objective:
                 strategy_objective_func = strategy_objectives.trading_strategy_objective_sqn
+            elif "Плавность Equity" in objective_choice:
+                strategy_objective_func = strategy_objectives.trading_strategy_objective_equity_curve_linearity
             elif "HFT" in objective_choice:
                 strategy_objective_func = strategy_objectives.trading_strategy_objective_hft_score
             elif "Качество данных для ML" in objective_choice:

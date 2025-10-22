@@ -1,10 +1,26 @@
 import streamlit as st
 import pandas as pd
 import json
-import os
+import os, random, torch
 import datetime
 import re
 import tempfile
+import numpy as np
+
+def set_random_seed(seed: int):
+    """
+    Устанавливает "зерно" случайности для всех необходимых библиотек,
+    чтобы обеспечить воспроизводимость результатов, особенно для нейросетей.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        # Эти настройки могут замедлить обучение, но обеспечивают детерминизм на GPU
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 def _sanitize_filename(filename: str) -> str:
     """
@@ -298,10 +314,9 @@ def manage_profiles(module, params_func):
                     all_strategy_params = get_strategy_parameters("analysis")
                     profile_data.update(all_strategy_params)
                 elif module == "optimization":
-                    # --- ГЛАВНОЕ ИСПРАВЛЕНИЕ: Автоматический сбор ВСЕХ параметров оптимизации ---
-                    # Вместо ручного перечисления каждого параметра, мы итерируемся по session_state
-                    # и собираем все ключи, которые относятся к оптимизации.
-                    # Это делает код гибким и устойчивым к добавлению новых параметров в UI.
+                    # --- ИСПРАВЛЕНИЕ: Собираем ВСЕ параметры оптимизации, а не только видимые ---
+                    # Итерируемся по всем ключам в session_state, чтобы сохранить диапазоны для всех
+                    # моделей (CatBoost и MLP), независимо от того, какая выбрана в UI в данный момент.
                     suffix = "_optimization"
                     for session_key, value in st.session_state.items():
                         if session_key.endswith(suffix):
@@ -309,9 +324,10 @@ def manage_profiles(module, params_func):
                             if not any(ui_part in session_key for ui_part in ['profile_name', 'select_profile', 'select_all_data', 'csv_', 'save_profile', 'load_profile']):
                                 # Убираем суффикс, чтобы получить "чистый" ключ
                                 clean_key = session_key[:-len(suffix)]
-                                # --- ИСПРАВЛЕНИЕ: Преобразуем объекты date в строку перед сохранением ---
                                 if isinstance(value, datetime.date):
                                     profile_data[clean_key] = str(value)
+                                elif "ml_model_type" in session_key: # Сохраняем тип модели
+                                    profile_data[clean_key] = value
                                 else:
                                     profile_data[clean_key] = value
 

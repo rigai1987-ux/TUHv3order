@@ -11,9 +11,8 @@ from ui.analysis_page import show_analysis_page
 from ui.optimization_page import show_optimization_page
 # Заглушка для будущего модуля
 # from ui.analytics_page import show_analytics_page
-
 # Импортируем общие утилиты
-from app_utils import load_profile_to_session_state
+from app_utils import load_profile_to_session_state, set_random_seed
 
 # Импортируем бэкенд модули
 import optuna_optimizer as wfo_optuna # Импортируем модуль оптимизации
@@ -24,6 +23,9 @@ st.set_page_config(
     page_icon="📈",
     layout="wide"
 )
+
+# --- НОВОЕ: Устанавливаем глобальное зерно случайности для воспроизводимости ---
+set_random_seed(42)
 
 # Создание директорий для хранения профилей и прогонов
 os.makedirs("profiles", exist_ok=True)

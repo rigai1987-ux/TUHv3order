@@ -138,6 +138,7 @@ def run_wfo_parallel(
     wfo_summary = []
     all_oos_trades = []
     out_of_sample_results = []
+    all_opt_errors = [] # Список для сбора ошибок из всех шагов
 
     for task in sorted(completed_tasks, key=lambda x: x['step_count']):
         in_sample_opt_results = task['in_sample_opt_results']
@@ -145,6 +146,12 @@ def run_wfo_parallel(
         if not in_sample_opt_results or not in_sample_opt_results.get('best_params'):
             st.warning(f"На шаге {task['step_count']} не найдено оптимальных параметров. Пропуск.")
             continue
+
+        # Собираем ошибки, если они были
+        if in_sample_opt_results.get('errors'):
+            for error in in_sample_opt_results['errors']:
+                error['wfo_step'] = task['step_count'] # Добавляем номер шага к ошибке
+            all_opt_errors.extend(in_sample_opt_results['errors'])
 
         best_params = in_sample_opt_results['best_params']
 
@@ -165,7 +172,7 @@ def run_wfo_parallel(
                 X_final, y_final = label_all_signals(df_with_features_final, signal_indices_final, best_params)
 
                 # --- ИЗМЕНЕНИЕ: Проверяем, что в y_final есть и 0, и 1 для обучения ---
-                if not X_final.empty and y_final.nunique() > 1 and y_final.sum() > 5:
+                if not X_final.empty and y_final.nunique() > 1 and y_final.sum() > 3:
                     # 3. Обучаем финальную модель
                     final_model_bundle = train_ml_model(X_final, y_final, best_params)
                     # 4. Добавляем модель и флаг в параметры для Out-of-Sample симуляции
@@ -182,7 +189,7 @@ def run_wfo_parallel(
                     if X_final.empty:
                         reason = f"Не найдено сигналов, приведших к сделкам (найдено базовых сигналов: {len(signal_indices_final)})."
                     else:
-                        reason = f"Найдено всего {y_final.sum()} успешных сигналов (требуется > 5)."
+                        reason = f"Найдено всего {y_final.sum()} успешных сигналов (требуется > 3)."
                     st.warning(f"∅ Шаг {task['step_count']}: Недостаточно данных для финального обучения ML-модели. Тест будет без ML-фильтра. Причина: {reason}")
         # --- КОНЕЦ НОВОГО БЛОКА ---
 
@@ -212,6 +219,14 @@ def run_wfo_parallel(
         wfo_summary.append(summary_step)
 
     st.success("Walk-Forward оптимизация (параллельный режим) завершена!")
+
+    # Отображаем собранные ошибки после завершения всех процессов
+    if all_opt_errors:
+        st.error(f"Во время WFO произошло {len(all_opt_errors)} ошибок в пробах оптимизации:")
+        for error_info in all_opt_errors[:10]: # Показываем первые 10
+            with st.expander(f"Ошибка на шаге WFO #{error_info['wfo_step']} (проба #{error_info['trial_number']}): {error_info['error']}"):
+                st.json(error_info['params'])
+
 
     # --- Агрегация финальных результатов (аналогично run_wfo) ---
     if not out_of_sample_results:

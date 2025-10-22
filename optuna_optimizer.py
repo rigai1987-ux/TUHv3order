@@ -142,12 +142,10 @@ def run_optimization(params):
         os.remove(stop_file)
 
     # После завершения оптимизации выводим все собранные ошибки в основном потоке
-    if errors:
-        st.error(f"Во время оптимизации произошло {len(errors)} ошибок в пробах:")
-        for error_info in errors[:5]: # Показываем первые 5 ошибок, чтобы не перегружать интерфейс
-            with st.expander(f"Ошибка в пробе #{error_info['trial_number']}: {error_info['error']}"):
-                st.json(error_info['params'])
-
+    # --- ИСПРАВЛЕНИЕ: Не вызываем st.error из этой функции.
+    # Вместо этого, возвращаем ошибки, чтобы вызывающий код мог их обработать.
+    # Это предотвращает ошибку 'missing ScriptRunContext' при вызове из WFO.
+    
     if is_multi_objective:
         best_trials = sorted(study.best_trials, key=lambda t: t.values[0], reverse=True)
         if not best_trials:
@@ -200,6 +198,7 @@ def run_optimization(params):
         'best_params': best_params,
         'top_10_results': top_10_results,        
         'study': study,
+        'errors': errors # Возвращаем список ошибок
     }
 
 def run_iterative_optimization(params):
@@ -266,5 +265,14 @@ def run_iterative_optimization(params):
     params['param_space'] = new_param_space
     
     final_results = run_optimization(params)
+
+    # --- НОВЫЙ БЛОК: Отображение ошибок после завершения оптимизации ---
+    # Так как run_iterative_optimization всегда вызывается из основного потока,
+    # здесь безопасно использовать st.error.
+    if final_results and final_results.get('errors'):
+        st.error(f"Во время оптимизации произошло {len(final_results['errors'])} ошибок в пробах:")
+        for error_info in final_results['errors'][:5]: # Показываем первые 5
+            with st.expander(f"Ошибка в пробе #{error_info['trial_number']}: {error_info['error']}"):
+                st.json(error_info['params'])
 
     return final_results

@@ -186,6 +186,7 @@ class TradingSimulator:
         if params.get('ml_model_bundle') and params.get('use_ml_filter'):
             from ml_model_handler import generate_features # Локальный импорт
             df_with_features = generate_features(df_with_features, params)
+            import torch # Локальный импорт для PyTorch
         used_params.update(signal_gen_used_params)
 
         open_prices = df_with_features['open'].values
@@ -217,6 +218,7 @@ class TradingSimulator:
 
             # --- НОВЫЙ БЛОК: Фильтрация сигналов с помощью ML-модели ---
             ml_bundle = params.get('ml_model_bundle')
+            prediction = [1] # По умолчанию считаем сигнал хорошим
             if ml_bundle and params.get('use_ml_filter'):
                 model = ml_bundle['model']
                 scaler = ml_bundle['scaler']
@@ -224,23 +226,42 @@ class TradingSimulator:
                 numerical_features = ml_bundle['numerical_features']
                 categorical_features = ml_bundle.get('categorical_features', [])
 
-                # Извлекаем признаки для текущего сигнала из обогащенного DataFrame
-                signal_features = df_with_features.loc[[analysis_idx]][feature_names]
-                
-                features_for_prediction = signal_features.copy()
-                
-                # --- ИСПРАВЛЕНИЕ: Корректно масштабируем признаки перед предсказанием ---
-                # 1. Масштабируем только числовые признаки
-                num_features_in_df = [f for f in numerical_features if f in features_for_prediction.columns]
-                if scaler and num_features_in_df:
-                    features_for_prediction[num_features_in_df] = scaler.transform(features_for_prediction[num_features_in_df])
-                # 2. Приводим категориальные признаки к нужному типу (если они есть)
-                for col in categorical_features:
-                    if col in features_for_prediction.columns:
-                        features_for_prediction[col] = features_for_prediction[col].astype(int)
-                
-                # Предсказываем вероятность "успешного" сигнала
-                prediction = model.predict(features_for_prediction[feature_names])
+                # --- НОВЫЙ БЛОК: Универсальная логика предсказания ---
+                model_type = ml_bundle.get('model_type', 'CatBoost')
+                signal_features_df = df_with_features.loc[[analysis_idx]]
+
+                if model_type == 'CatBoost':
+                    features_for_prediction = signal_features_df.copy()
+                    num_features_in_df = [f for f in numerical_features if f in features_for_prediction.columns]
+                    if scaler and num_features_in_df:
+                        features_for_prediction[num_features_in_df] = scaler.transform(features_for_prediction[num_features_in_df])
+                    for col in categorical_features:
+                        if col in features_for_prediction.columns:
+                            features_for_prediction[col] = features_for_prediction[col].astype(int)
+                    prediction = model.predict(features_for_prediction[feature_names])
+
+                elif model_type == 'NeuralNetwork':
+                    features_for_prediction = signal_features_df.copy()
+                    num_features_in_df = [f for f in numerical_features if f in features_for_prediction.columns]
+                    if scaler and num_features_in_df:
+                        features_for_prediction[num_features_in_df] = scaler.transform(features_for_prediction[num_features_in_df])
+                    
+                    # One-hot encoding для категориальных признаков
+                    features_nn = pd.get_dummies(features_for_prediction, columns=categorical_features, drop_first=True)
+                    # Приводим столбцы к тому же порядку, что и при обучении
+                    nn_columns = ml_bundle.get('nn_columns')
+                    if nn_columns:
+                        features_nn = features_nn.reindex(columns=nn_columns, fill_value=0)
+
+                    # Предсказание с помощью PyTorch
+                    model.eval() # Переводим модель в режим оценки
+                    with torch.no_grad():
+                        X_tensor = torch.tensor(features_nn.values, dtype=torch.float32)
+                        output = model(X_tensor)
+                        # Применяем сигмоиду и порог 0.5 для получения бинарного предсказания
+                        pred_prob = torch.sigmoid(output)
+                        prediction = (pred_prob > 0.5).int().numpy()
+
                 if prediction[0] == 0: # Если модель предсказывает провал (0)
                     # --- НОВЫЙ БЛОК: Симулируем пропущенную сделку для анализа ---
                     # Это нужно, чтобы потом можно было посмотреть, от каких сделок модель отказалась.
@@ -280,8 +301,10 @@ class TradingSimulator:
                         }
                         self.trades.append(skipped_trade) # Добавляем в основной список сделок
 
-                    # Пропускаем этот сигнал и переходим к следующему
-                    continue # Пропускаем этот сигнал
+                    # --- ИСПРАВЛЕНИЕ: Обновляем current_idx даже для пропущенных сделок ---
+                    # Это предотвращает наложение сделок, так как следующий сигнал будет искаться только после завершения этой "виртуальной" сделки.
+                    current_idx = temp_exit_idx if temp_direction_str != "none" else analysis_idx
+                    continue
             # --- Конец блока ML-фильтрации ---
 
             direction = None
