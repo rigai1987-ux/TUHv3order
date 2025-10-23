@@ -39,6 +39,7 @@ class TradingSimulator:
        self.stop_loss_pct = stop_loss_pct
        self.take_profit_pct = take_profit_pct
        self.trades = []
+       self.skipped_trades = [] # <-- НОВОЕ: Отдельный список для пропущенных сделок
        self.pnl_history = []
        self.balance_history = []
        self.current_position = None
@@ -299,7 +300,7 @@ class TradingSimulator:
                             'pnl': 0, # PnL не считаем, т.к. сделки не было
                             'skipped_by_ml': True # Флаг, что сделка пропущена
                         }
-                        self.trades.append(skipped_trade) # Добавляем в основной список сделок
+                        self.skipped_trades.append(skipped_trade) # <-- ИЗМЕНЕНИЕ: Добавляем в отдельный список
 
                     # --- ИСПРАВЛЕНИЕ: Обновляем current_idx даже для пропущенных сделок ---
                     # Это предотвращает наложение сделок, так как следующий сигнал будет искаться только после завершения этой "виртуальной" сделки.
@@ -393,11 +394,10 @@ class TradingSimulator:
 
         # Рассчитываем PnL для всех сделок после цикла
         # --- ИЗМЕНЕНИЕ: Отделяем реальные сделки от пропущенных для расчета PnL ---
-        real_trades = [t for t in self.trades if not t.get('skipped_by_ml')]
-        skipped_trades = [t for t in self.trades if t.get('skipped_by_ml')]
+        # Теперь real_trades - это просто self.trades
 
         # PnL и баланс считаем только для реальных сделок
-        for trade in real_trades: # --- ИСПРАВЛЕНИЕ: Итерируемся только по реальным сделкам ---
+        for trade in self.trades: # Итерируемся по self.trades, который теперь содержит только реальные сделки
             if trade['direction'] == 'long':
                 pnl = (trade['exit_price'] - trade['entry_price']) / trade['entry_price']
             else: # short
@@ -409,9 +409,9 @@ class TradingSimulator:
             balance_value = self.initial_balance + pnl_amount if not self.balance_history else self.balance_history[-1] + pnl_amount
             self.balance_history.append(balance_value)
 
-        return self.calculate_metrics(used_params)
+        return self.calculate_metrics(used_params, self.skipped_trades)
 
-    def calculate_metrics(self, used_params=None):
+    def calculate_metrics(self, used_params=None, skipped_trades=None):
         """Вычисляет итоговые метрики после симуляции."""
         # Рассчитываем метрики с использованием векторизованных операций
         if self.pnl_history:            
@@ -500,6 +500,7 @@ class TradingSimulator:
             'expectancy': float(expectancy), # NEW
             'avg_pnl_per_trade': float(avg_pnl_per_trade), # NEW
             'trades': self.trades,
+            'skipped_trades': skipped_trades if skipped_trades is not None else [], # <-- НОВОЕ: Добавляем пропущенные сделки
             'pnl_history': self.pnl_history,
             'balance_history': self.balance_history,
             'final_balance': self.balance_history[-1] if self.balance_history else self.initial_balance,

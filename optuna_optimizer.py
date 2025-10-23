@@ -73,6 +73,21 @@ def run_optimization(params):
                     metric = metric[0]
             else:
                 metric = result # Для обратной совместимости
+            # --- ИЗМЕНЕНИЕ: Всегда ожидаем кортеж (metric, sim_results) ---
+            metric, sim_results = strategy_func(data, full_params)
+
+            # Сохраняем дополнительные метрики из sim_results в атрибуты пробы
+            if isinstance(sim_results, dict):
+                for key, value in sim_results.items():
+                    # Исключаем большие объекты, которые не нужны в логах Optuna,
+                    # но сохраняем feature_importances и другие полезные данные.
+                    if key not in ['trades', 'pnl_history', 'balance_history', 'used_params', 'ml_model_bundle']:
+                        trial.set_user_attr(key, value)
+            
+            # Для одноцелевой оптимизации, если возвращается кортеж/список метрик, берем первый элемент
+            if not is_multi_objective and isinstance(metric, (list, tuple)):
+                metric = metric[0]
+
         except Exception as e:
             # НЕ используем st.error здесь. Собираем ошибки в потокобезопасный список.
             errors.append({
@@ -90,12 +105,15 @@ def run_optimization(params):
         if target_metric_value is not None:
             current_value = metric[0] if isinstance(metric, tuple) else metric
             if current_value >= target_metric_value:
+            if current_value is not None and current_value >= target_metric_value:
                 trial.study.stop()
         
         # Если метрика является штрафом, сохраняем причину для отладки
         if sim_results: # sim_results будет пустым, если была ошибка
+        if sim_results: # sim_results может быть пустым, если была ошибка
             if (is_multi_objective and metric[0] < 0) or (not is_multi_objective and metric < 0):
                 # --- ИСПРАВЛЕНИЕ: Безопасное форматирование PnL ---
+                # Безопасное форматирование PnL
                 pnl_value = sim_results.get('total_pnl', 'N/A')
                 pnl_str = f"{pnl_value:.2f}" if isinstance(pnl_value, (int, float)) else str(pnl_value)
                 trial.set_user_attr("reason_for_penalty", f"Недостаточно сделок или убыточность. Trades: {sim_results.get('total_trades', 'N/A')}, PnL: {pnl_str}")

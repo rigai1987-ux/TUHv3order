@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import StandardScaler
+from hmmlearn.hmm import GaussianHMM
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import f1_score, precision_score, accuracy_score, recall_score
 from catboost import CatBoostClassifier
@@ -32,6 +33,38 @@ class SimpleMLP(nn.Module):
 
     def forward(self, x):
         return self.network(x)
+
+def train_hmm_and_get_regimes(df: pd.DataFrame, n_states: int = 3, features_for_hmm: list = None) -> tuple[pd.Series, GaussianHMM, StandardScaler]:
+    """
+    Обучает GaussianHMM и предсказывает рыночные режимы.
+
+    Args:
+        df (pd.DataFrame): DataFrame с признаками.
+        n_states (int): Количество скрытых состояний (режимов) для HMM.
+        features_for_hmm (list): Список признаков для обучения HMM.
+
+    Returns:
+        tuple: (Серия с режимами, обученная модель HMM, обученный скейлер для HMM).
+    """
+    if features_for_hmm is None:
+        # Признаки, хорошо описывающие "характер" рынка: волатильность, направленность
+        features_for_hmm = ['natr', 'growth_pct', 'relative_body_size']
+    
+    available_features = [f for f in features_for_hmm if f in df.columns]
+    if not available_features:
+        return pd.Series(np.zeros(len(df)), index=df.index, dtype=int), None, None
+
+    hmm_data = df[available_features].values
+    
+    scaler = StandardScaler()
+    hmm_data_scaled = scaler.fit_transform(hmm_data)
+
+    model = GaussianHMM(n_components=n_states, covariance_type="diag", n_iter=1000, random_state=42)
+    model.fit(hmm_data_scaled)
+    
+    hidden_states = model.predict(hmm_data_scaled)
+    
+    return pd.Series(hidden_states, index=df.index, name='market_regime'), model, scaler
 
 def get_trade_outcome(
     signal_idx: int,
@@ -269,19 +302,27 @@ def train_ml_model(X: pd.DataFrame, y: pd.Series, ml_params: dict, model_type: s
     Returns:
         dict: Словарь, содержащий обученную модель, скейлер, имена признаков и их важность.
     """
+    # --- НОВЫЙ БЛОК: Обучение HMM и добавление признака режима ---
+    # Обучаем HMM на всем датафрейме X, чтобы получить консистентные режимы
+    hmm_n_states = ml_params.get('hmm_n_states', 3)
+    market_regime_feature, hmm_model, hmm_scaler = train_hmm_and_get_regimes(X, n_states=hmm_n_states)
+    X_with_regime = X.join(market_regime_feature)
+    # --- КОНЕЦ НОВОГО БЛОКА ---
+
     # Определяем список всех признаков, которые будут использоваться
     feature_names = [
         'prints_strength', 'market_strength', 'hldir_strength',
         'relative_body_size', 'upper_wick_ratio',
         'hour_of_day',
-        'natr', 'growth_pct' # Добавляем базовые индикаторы как признаки
+        'natr', 'growth_pct', # Добавляем базовые индикаторы как признаки
+        'market_regime' # <-- НАШ НОВЫЙ ПРИЗНАК
     ]
     
     # Отбираем только те признаки, которые есть в DataFrame X
     available_features = [f for f in feature_names if f in X.columns]
-    X_train = X[available_features]
+    X_train = X_with_regime[available_features]
     # Определяем категориальные и числовые признаки
-    categorical_features = [col for col in ['hour_of_day'] if col in X_train.columns]
+    categorical_features = [col for col in ['hour_of_day', 'market_regime'] if col in X_train.columns]
     numerical_features = [col for col in available_features if col not in categorical_features]
     
     # Масштабирование числовых признаков
@@ -372,7 +413,8 @@ def train_ml_model(X: pd.DataFrame, y: pd.Series, ml_params: dict, model_type: s
             'upper_wick_ratio': "**Отношение верхней тени**: Отношение верхней тени к общему диапазону свечи. Формула: `(high - max(open, close)) / (high - low)`",
             'hour_of_day': "**Час дня**: Час, в который сформировался сигнал (0-23). Категориальный признак.",
             'natr': "**Нормализованный ATR**: Индикатор волатильности NATR. Показывает средний диапазон свечи в процентах от цены.",
-            'growth_pct': "**Процент роста**: Рост цены за `lookback_period` свечей. Показывает недавний импульс."
+            'growth_pct': "**Процент роста**: Рост цены за `lookback_period` свечей. Показывает недавний импульс.",
+            'market_regime': f"**Рыночный режим (HMM, {hmm_n_states} сост.)**: Скрытое состояние рынка, определенное Скрытой Марковской Моделью. Категориальный признак."
         }
         # --- Конец нового блока ---
         feature_importances['description'] = feature_importances['feature'].map(feature_descriptions)
@@ -386,6 +428,9 @@ def train_ml_model(X: pd.DataFrame, y: pd.Series, ml_params: dict, model_type: s
         "numerical_features": numerical_features,
         "categorical_features": categorical_features, # Добавляем информацию о категориальных признаках
         "feature_importances": feature_importances,
+        "hmm_model": hmm_model, # Сохраняем обученную HMM
+        "hmm_scaler": hmm_scaler, # Сохраняем скейлер для HMM
+        "hmm_features": [f for f in ['natr', 'growth_pct', 'relative_body_size'] if f in X.columns], # Признаки для HMM
         # Для нейросети сохраняем one-hot encoded колонки, чтобы использовать их при предсказании
         "nn_columns": X_nn.columns.tolist() if model_type == 'NeuralNetwork' else None
     }

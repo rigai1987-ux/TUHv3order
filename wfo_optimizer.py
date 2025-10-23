@@ -16,6 +16,7 @@ import streamlit as st
 import optuna
 import numpy as np
 # Импортируем ML-функции
+import strategy_objectives # <--- КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ
 from signal_generator import generate_signals
 from ml_model_handler import label_all_signals, generate_features, train_ml_model
 
@@ -44,7 +45,7 @@ def _wfo_optimization_task(task_params):
     # Это решает проблему с сериализацией (pickling) и гарантирует, что 'strategy_func_name'
     # останется в `task['opt_params']` для использования на этапе сборки результатов.
     strategy_func_name = opt_params['strategy_func_name']
-    opt_params['strategy_func'] = globals().get(strategy_func_name)
+    opt_params['strategy_func'] = getattr(strategy_objectives, strategy_func_name)
     
     print(f"Starting parallel WFO optimization for step {step_count}/{total_steps}...")
     in_sample_opt_results = optuna_optimizer.run_optimization(opt_params)
@@ -64,6 +65,13 @@ def run_wfo_parallel(
     Это значительно быстрее, но не предоставляет пошагового UI.
     """
     # 1. --- Фаза подготовки: нарезка данных и создание задач ---
+    # --- КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: Гарантируем наличие объекта функции ---
+    # Если функция была удалена и передано только имя (для сериализации),
+    # восстанавливаем ее здесь, до начала создания задач.
+    if 'strategy_func' not in opt_params and 'strategy_func_name' in opt_params:
+        strategy_func_name = opt_params['strategy_func_name']
+        opt_params['strategy_func'] = getattr(strategy_objectives, strategy_func_name, None)
+
     st.info("Фаза 1: Подготовка данных и создание задач для WFO...")
     
     train_period = wfo_params['train_period']
@@ -472,6 +480,11 @@ def run_wfo_with_auto_ranges(
     is_ml_wfo = "ml" in strategy_objective_func.__name__
     if is_ml_wfo:
         opt_params_for_wfo['is_ml_wfo'] = True
+        # --- ИСПРАВЛЕНИЕ: Передаем имя функции, а не сам объект, для корректной сериализации ---
+        # Это решает проблему 'NoneType' object is not callable при параллельном запуске.
+        opt_params_for_wfo['strategy_func_name'] = strategy_objective_func.__name__
+        opt_params_for_wfo.pop('strategy_func', None) # Удаляем сам объект функции
+
         st.info("Обнаружена ML-цель. На каждом шаге WFO будет обучаться и применяться ML-фильтр.")
     
     # Запускаем стандартный параллельный WFO

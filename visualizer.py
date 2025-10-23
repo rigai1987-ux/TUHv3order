@@ -727,3 +727,135 @@ def create_wfo_report_html(
     </html>
     """
     return html_template
+
+def create_wfo_report_html(
+    results_ml: dict,
+    results_no_ml: dict,
+    param_space: dict,
+    run_name: str = "WFO Report"
+) -> str:
+    """
+    Создает единый HTML-файл с полными результатами WFO-сравнения.
+
+    Args:
+        results_ml (dict): Результаты WFO-прогона с ML-фильтром.
+        results_no_ml (dict): Результаты WFO-прогона без ML-фильтра.
+        param_space (dict): Пространство параметров, использованное для оптимизации.
+        run_name (str): Название прогона для заголовка отчета.
+
+    Returns:
+        str: Строка, содержащая полный HTML-код отчета.
+    """
+    # --- Подготовка данных и графиков ---
+    summary_ml_df = pd.DataFrame(results_ml.get('summary', []))
+    summary_no_ml_df = pd.DataFrame(results_no_ml.get('summary', []))
+
+    # Сравнительная таблица метрик
+    comparison_metrics_df = pd.DataFrame([
+        {"Метод": "С ML-фильтром", **results_ml['aggregated_metrics']},
+        {"Метод": "Без ML (Baseline)", **results_no_ml['aggregated_metrics']}
+    ]).set_index("Метод").T # Транспонируем для лучшей читаемости
+
+    # Генерация всех необходимых графиков
+    fig_comparison_equity = plot_wfo_comparison(results_ml, results_no_ml)
+    fig_ml_effectiveness = plot_wfo_ml_effectiveness(summary_ml_df, summary_no_ml_df)
+    fig_param_stability_ml = plot_wfo_parameter_stability(summary_ml_df, param_space)
+    fig_param_stability_no_ml = plot_wfo_parameter_stability(summary_no_ml_df, param_space)
+    fig_risk_ml = plot_wfo_risk_metrics(summary_ml_df)
+    fig_risk_no_ml = plot_wfo_risk_metrics(summary_no_ml_df)
+
+    # Конвертация графиков в HTML (без полной обертки и без повторного включения JS)
+    html_comparison_equity = fig_comparison_equity.to_html(full_html=False, include_plotlyjs=False) if fig_comparison_equity else ""
+    html_ml_effectiveness = fig_ml_effectiveness.to_html(full_html=False, include_plotlyjs=False) if fig_ml_effectiveness else ""
+    html_param_stability_ml = fig_param_stability_ml.to_html(full_html=False, include_plotlyjs=False) if fig_param_stability_ml else ""
+    html_param_stability_no_ml = fig_param_stability_no_ml.to_html(full_html=False, include_plotlyjs=False) if fig_param_stability_no_ml else ""
+    html_risk_ml = fig_risk_ml.to_html(full_html=False, include_plotlyjs=False) if fig_risk_ml else ""
+    html_risk_no_ml = fig_risk_no_ml.to_html(full_html=False, include_plotlyjs=False) if fig_risk_no_ml else ""
+
+    # --- Сборка HTML-документа ---
+    html_template = f"""
+    <!DOCTYPE html>
+    <html lang="ru">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>{run_name}</title>
+        <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+        <style>
+            body {{
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+                line-height: 1.6;
+                color: #e6e6e6;
+                background-color: #0e1117;
+                margin: 0;
+                padding: 20px;
+            }}
+            .container {{
+                max-width: 1200px;
+                margin: auto;
+            }}
+            h1, h2, h3 {{
+                color: #fafafa;
+                border-bottom: 1px solid #333;
+                padding-bottom: 10px;
+            }}
+            table {{
+                width: 100%;
+                border-collapse: collapse;
+                margin-bottom: 20px;
+            }}
+            th, td {{
+                border: 1px solid #333;
+                padding: 8px;
+                text-align: left;
+            }}
+            th {{
+                background-color: #1a1f2b;
+            }}
+            tr:nth-child(even) {{
+                background-color: #161a24;
+            }}
+            .plotly-graph-div {{
+                margin-bottom: 30px;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>Отчет по Walk-Forward Optimization: {run_name}</h1>
+            <p><strong>Дата генерации:</strong> {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+
+            <h2>Итоговые метрики</h2>
+            {comparison_metrics_df.to_html(classes='table table-striped', float_format='{:.2f}'.format)}
+
+            <h2>Сравнение кривых доходности</h2>
+            {html_comparison_equity}
+
+            <h2>Анализ эффективности ML-фильтра</h2>
+            {html_ml_effectiveness}
+
+            <hr>
+
+            <h2>Детализация: Прогон с ML-фильтром</h2>
+            <h3>Метрики риска и доходности по шагам (с ML)</h3>
+            {html_risk_ml}
+            <h3>Стабильность параметров (с ML)</h3>
+            {html_param_stability_ml}
+            <h3>Сводная таблица по шагам (с ML)</h3>
+            {summary_ml_df.to_html(classes='table table-striped', float_format='{:.2f}'.format, index=False)}
+
+            <hr>
+
+            <h2>Детализация: Прогон без ML (Baseline)</h2>
+            <h3>Метрики риска и доходности по шагам (без ML)</h3>
+            {html_risk_no_ml}
+            <h3>Стабильность параметров (без ML)</h3>
+            {html_param_stability_no_ml}
+            <h3>Сводная таблица по шагам (без ML)</h3>
+            {summary_no_ml_df.to_html(classes='table table-striped', float_format='{:.2f}'.format, index=False)}
+
+        </div>
+    </body>
+    </html>
+    """
+    return html_template

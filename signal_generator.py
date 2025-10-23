@@ -53,6 +53,26 @@ def calculate_natr(high, low, close, period):
     natr = np.divide(atr, close, out=np.full_like(close, np.nan, dtype=float), where=close!=0) * 100
     return natr
 
+def calculate_cagr(initial_balance, final_balance, days):
+    """
+    Рассчитывает среднегодовую доходность (CAGR).
+
+    Args:
+        initial_balance (float): Начальный баланс.
+        final_balance (float): Конечный баланс.
+        days (int): Количество дней в периоде.
+
+    Returns:
+        float: Значение CAGR или 0.0, если расчет невозможен.
+    """
+    if initial_balance <= 0 or final_balance <= 0 or days <= 0:
+        return 0.0
+    
+    years = days / 365.25
+    if years == 0: return 0.0
+
+    return (final_balance / initial_balance) ** (1 / years) - 1
+
 def generate_signals(df, params, return_indicators=False):
     """
     Генерация сигналов на основе параметров стратегии

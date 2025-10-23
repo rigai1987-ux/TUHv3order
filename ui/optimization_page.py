@@ -273,8 +273,6 @@ def show_optimization_page():
 
         objective_choice = st.selectbox(
             "Цель оптимизации",
-            options=["SQN (стабильность)", "Плавность Equity (R-квадрат)", "HFT Score (частота и стабильность)", "Качество данных для ML (для WFO)", "SQN, Max Drawdown и Эффективность сигналов (многоцелевая)", "SQN с ML-фильтром (Optuna)", "SQN, Max Drawdown, Эффективность + ML (многоцелевая)"],
-            index=2, key="objective_choice",
             options=["Calmar Ratio (риск/доходность)", "SQN (стабильность)", "Плавность Equity (R-квадрат)", "HFT Score (частота и стабильность)", "Качество данных для ML (для WFO)", "Прибыль, Просадка, Профит-фактор (многоцелевая)", "Calmar Ratio с ML-фильтром", "Прибыль, Просадка, ПФ + ML (многоцелевая)"],
             index=0, key="objective_choice",
             help="SQN - стабильность. Плавность Equity - ищет линейный рост. HFT Score - для HFT. Качество данных для ML - лучшая цель для WFO с ML-фильтром. Многоцелевая - компромисс. С ML-фильтром (Optuna) - обучает модель на каждой пробе, медленно."
@@ -678,7 +676,6 @@ def show_optimization_page():
 
 def _get_objective_func(objective_choice, is_multi_objective):
     """Вспомогательная функция для выбора целевой функции по названию из UI."""
-    if "SQN" in objective_choice and "ML" in objective_choice and is_multi_objective:
     if "Calmar" in objective_choice and "ML" in objective_choice:
         return strategy_objectives.trading_strategy_objective_calmar_ml
     elif "Calmar" in objective_choice:

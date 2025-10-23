@@ -521,26 +521,31 @@ def show_analysis_page():
             # --- Этот блок должен быть снаружи, так как он относится к результатам симуляции, а не к обучению ML ---
             if "simulation_results" in st.session_state:
                 results = st.session_state["simulation_results"]
-                if results['trades']:
-                    # --- ИЗМЕНЕНИЕ: Разделяем сделки для корректного отображения в таблице ---
-                    real_trades = [t for t in results['trades'] if not t.get('skipped_by_ml')]
+                real_trades = results.get('trades', [])
+                skipped_trades = results.get('skipped_trades', [])
+
+                if real_trades:
+                    # --- ИЗМЕНЕНИЕ: Теперь `results['trades']` содержит только реальные сделки, фильтрация не нужна ---
                     st.subheader(f"Список реальных сделок ({len(real_trades)})")
                     trades_data = {
                         'Индекс входа': [trade['entry_idx'] for trade in real_trades],
                         'Цена входа': [trade['entry_price'] for trade in real_trades],
                         'Направление': [trade['direction'] for trade in real_trades],
                         'Цена выхода': [trade['exit_price'] for trade in real_trades],
-                        'PnL': [trade['pnl'] for trade in real_trades],
+                        'PnL': [f"${trade['pnl']:.2f}" for trade in real_trades],
                         'Причина выхода': [trade['exit_reason'] for trade in real_trades]
                     }
                     trades_df_display = pd.DataFrame(trades_data)
+                    # --- ИСПРАВЛЕНИЕ: Используем st.dataframe вместо st.table для лучшего отображения ---
                     st.dataframe(trades_df_display, use_container_width=True)
 
                     # --- ИЗМЕНЕНИЕ: Секция для скриншотов теперь отображает ВСЕ сделки (реальные и пропущенные) ---
 
                     st.subheader("Хронология сделок (включая пропущенные ML-фильтром)")
                     # Сортируем все сделки по индексу входа для правильной хронологии
-                    all_trades_sorted = sorted(results['trades'], key=lambda x: x['entry_idx'])
+                    # --- ИСПРАВЛЕНИЕ: Объединяем реальные и пропущенные сделки для отрисовки ---
+                    all_trades = real_trades + skipped_trades
+                    all_trades_sorted = sorted(all_trades, key=lambda x: x['entry_idx'])
                     # Проверяем, была ли нажата кнопка или установлен флаг авто-генерации
                     run_screenshots = st.button("Сгенерировать скриншоты сделок", key="generate_screenshots")
                     if run_screenshots or st.session_state.get('auto_generate_screenshots'):

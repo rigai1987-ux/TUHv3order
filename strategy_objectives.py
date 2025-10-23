@@ -3,7 +3,7 @@ import pandas as pd
 from typing import Dict, Any, Tuple
 from trading_simulator import run_trading_simulation
 # Импортируем необходимые функции для ML
-from signal_generator import generate_signals
+from signal_generator import generate_signals, calculate_cagr
 from ml_model_handler import label_all_signals, generate_features, train_ml_model
 
 def trading_strategy_objective_sqn(
@@ -442,3 +442,164 @@ def trading_strategy_objective_equity_curve_linearity(
     r_squared = correlation_xy**2
 
     return r_squared, results
+
+def trading_strategy_objective_calmar(
+    data: pd.DataFrame,
+    params: Dict[str, Any]
+) -> Tuple[float, Dict[str, Any]]:
+    """
+    Целевая функция, основанная на Коэффициенте Кальмара с дополнительными фильтрами.
+    Calmar Ratio = Годовая доходность (CAGR) / Максимальная просадка.
+    Поощряет:
+    - Высокую годовую доходность.
+    - Низкую просадку.
+    Жестко штрафует за:
+    - Profit Factor <= 1.5
+    - Sharpe Ratio < 1.0
+    - Max Drawdown > 12% (0.12)
+
+    Args:
+        data: DataFrame с рыночными данными.
+        params: Словарь с параметрами стратегии.
+
+    Returns:
+        Кортеж ( (Calmar Ratio), results ).
+    """
+    results = run_trading_simulation(data, params)
+
+    min_trades_threshold = params.get('min_trades_threshold', 25)
+    total_trades = results.get('total_trades', 0)
+    total_pnl = results.get('total_pnl', 0.0)
+    profit_factor = results.get('profit_factor', 0.0)
+    sharpe_ratio = results.get('sharpe_ratio', 0.0)
+    max_drawdown = results.get('max_drawdown', 1.0)
+    initial_balance = params.get('position_size', 100.0)
+
+    # 1. Штраф за малое количество сделок
+    if total_trades < min_trades_threshold:
+        return -100.0 + total_trades, results
+
+    # 2. Жесткие штрафы за невыполнение минимальных требований к качеству
+    if profit_factor <= 1.5:
+        return -50.0 + (profit_factor - 1.5), results
+    if sharpe_ratio < 1.0:
+        return -40.0 + sharpe_ratio, results
+    if max_drawdown > 0.12: # Целевой предел 12%
+        # Штраф тем сильнее, чем больше просадка превышает порог
+        return -30.0 - (max_drawdown - 0.12) * 100, results
+
+    # 3. Расчет CAGR (Compound Annual Growth Rate)
+    final_balance = results.get('final_balance', initial_balance)
+    simulation_days = (data['datetime'].max() - data['datetime'].min()).days
+    cagr = calculate_cagr(initial_balance, final_balance, simulation_days)
+
+    if cagr <= 0:
+        return -20.0 + cagr, results
+
+    # 4. Расчет Calmar Ratio
+    if max_drawdown == 0:
+        # Идеальный, но маловероятный случай. Даем высокое значение.
+        return 20.0, results
+
+    calmar_ratio = cagr / max_drawdown
+
+    return np.clip(calmar_ratio, -10.0, 20.0), results
+
+def trading_strategy_multi_objective_advanced(
+    data: pd.DataFrame,
+    params: Dict[str, Any]
+) -> Tuple[Tuple[float, float, float], Dict[str, Any]]:
+    """
+    Продвинутая многоцелевая функция, оптимизирующая:
+    - Максимизирует Чистую прибыль (Total PnL)
+    - Минимизирует Максимальную просадку (Max Drawdown)
+    - Максимизирует Профит-фактор (Profit Factor)
+
+    Args:
+        data: DataFrame с рыночными данными.
+        params: Словарь с параметрами стратегии.
+
+    Returns:
+        Кортеж, содержащий ( (TotalPnL, -MaxDrawdown, ProfitFactor), results ).
+    """
+    results = run_trading_simulation(data, params)
+
+    min_trades_threshold = params.get('min_trades_threshold', 25)
+    total_trades = results.get('total_trades', 0)
+    total_pnl = results.get('total_pnl', 0.0)
+    max_drawdown = results.get('max_drawdown', 1.0)
+    profit_factor = results.get('profit_factor', 0.0)
+
+    # Штраф за малое количество сделок или убыточность
+    if total_trades < min_trades_threshold or total_pnl <= 0:
+        # Возвращаем худшие значения для всех целей
+        return (-1000.0, -1.0, 0.0), results
+
+    # Ограничиваем значения для стабильности оптимизатора
+    clipped_pnl = np.clip(total_pnl, -1000, 10000)
+    clipped_pf = np.clip(profit_factor, 0, 10)
+
+    # Возвращаем кортеж для многоцелевой оптимизации.
+    # Optuna будет максимизировать каждое из этих значений.
+    return (clipped_pnl, -max_drawdown, clipped_pf), results
+
+def trading_strategy_objective_calmar_ml(
+    data: pd.DataFrame,
+    params: Dict[str, Any]
+) -> Tuple[float, Dict[str, Any]]:
+    """
+    Целевая функция Calmar Ratio с ML-фильтром.
+    Обучает модель и запускает симуляцию, затем оценивает по `trading_strategy_objective_calmar`.
+    """
+    try:
+        # Шаги 1-3: Генерация сигналов, разметка, обучение модели
+        signal_indices, df_with_indicators, _ = generate_signals(data, params, return_indicators=True)
+        df_with_features = generate_features(df_with_indicators, params)
+        if not signal_indices: return -200.0, {}
+        X, y = label_all_signals(df_with_features, signal_indices, params)
+        if X.empty or y.nunique() < 2: return -150.0, {}
+        model_type = params.get("model_type", "CatBoost")
+        ml_model_bundle = train_ml_model(X, y, params, model_type=model_type)
+
+        # Шаг 4: Запуск симуляции с ML-фильтром
+        simulation_params = params.copy()
+        simulation_params['use_ml_filter'] = True
+        simulation_params['ml_model_bundle'] = ml_model_bundle
+        
+        # Шаг 5: Оценка результатов с помощью базовой функции Calmar
+        return trading_strategy_objective_calmar(data, simulation_params)
+    except Exception as e:
+        return -500.0, {"error": str(e)}
+
+def trading_strategy_multi_objective_advanced_ml(
+    data: pd.DataFrame,
+    params: Dict[str, Any]
+) -> Tuple[Tuple[float, float, float], Dict[str, Any]]:
+    """
+    Многоцелевая функция (PnL, -DD, PF) с ML-фильтром.
+    Обучает модель, запускает симуляцию с ML-фильтром и оценивает по `trading_strategy_multi_objective_advanced`.
+    """
+    try:
+        # Шаг 1: Генерация сигналов и признаков
+        signal_indices, df_with_indicators, _ = generate_signals(data, params, return_indicators=True)
+        if not signal_indices: return (-200.0, -1.0, 0.0), {}
+        df_with_features = generate_features(df_with_indicators, params)
+
+        # Шаг 2: Разметка и проверка данных
+        X, y = label_all_signals(df_with_features, signal_indices, params)
+        if X.empty or y.nunique() < 2: return (-150.0, -1.0, 0.0), {}
+
+        # Шаг 3: Обучение модели
+        model_type = params.get("model_type", "CatBoost")
+        ml_model_bundle = train_ml_model(X, y, params, model_type=model_type)
+
+        # Шаг 4: Запуск симуляции с ML-фильтром
+        simulation_params = params.copy()
+        simulation_params['use_ml_filter'] = True
+        simulation_params['ml_model_bundle'] = ml_model_bundle
+
+        # Шаг 5: Оценка результатов с помощью базовой многоцелевой функции (PnL, -DD, PF)
+        return trading_strategy_multi_objective_advanced(data, simulation_params)
+
+    except Exception as e:
+        return (-500.0, -1.0, 0.0), {"error": str(e)}
