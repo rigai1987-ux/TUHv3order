@@ -240,10 +240,10 @@ def show_optimization_page():
                     base_min_val = 2
                 elif "learning_rate" in param_name:
                     base_min_val = 0.0001 if ml_model_type_opt == "NeuralNetwork" else 0.01
-                elif "dropout_rate" in param_name:
-                    base_min_val = 0.0
+                elif "dropout_rate" in param_name: # --- ИЗМЕНЕНИЕ: Минимальный dropout теперь 0.01 ---
+                    base_min_val = 0.01
                 elif "epochs" in param_name:
-                    base_min_val = 5
+                    base_min_val = 5 # --- ИЗМЕНЕНИЕ: Явно устанавливаем минимум 5 ---
                 elif "hidden_size" in param_name or "batch_size" in param_name:
                     base_min_val = 16
                 else:
@@ -275,6 +275,8 @@ def show_optimization_page():
             "Цель оптимизации",
             options=["SQN (стабильность)", "Плавность Equity (R-квадрат)", "HFT Score (частота и стабильность)", "Качество данных для ML (для WFO)", "SQN, Max Drawdown и Эффективность сигналов (многоцелевая)", "SQN с ML-фильтром (Optuna)", "SQN, Max Drawdown, Эффективность + ML (многоцелевая)"],
             index=2, key="objective_choice",
+            options=["Calmar Ratio (риск/доходность)", "SQN (стабильность)", "Плавность Equity (R-квадрат)", "HFT Score (частота и стабильность)", "Качество данных для ML (для WFO)", "Прибыль, Просадка, Профит-фактор (многоцелевая)", "Calmar Ratio с ML-фильтром", "Прибыль, Просадка, ПФ + ML (многоцелевая)"],
+            index=0, key="objective_choice",
             help="SQN - стабильность. Плавность Equity - ищет линейный рост. HFT Score - для HFT. Качество данных для ML - лучшая цель для WFO с ML-фильтром. Многоцелевая - компромисс. С ML-фильтром (Optuna) - обучает модель на каждой пробе, медленно."
         )
         is_multi_objective = "многоцелевая" in objective_choice
@@ -478,6 +480,79 @@ def show_optimization_page():
             st.number_input("Мин. сделок для WFO", value=10, min_value=1, step=1, key="wfo_min_trades_threshold", help="Минимальное количество сделок на обучающем отрезке, чтобы результат считался значимым. Если сделок меньше, стратегия получит штраф.")
 
     # --- УПРОЩЕНИЕ: Оставляем одну кнопку для запуска WFO в режиме сравнения ---
+    # --- НОВЫЙ БЛОК: Кнопка для автоматического подбора диапазонов и запуска WFO ---
+    st.markdown("---")
+    st.subheader("🚀 WFO с автоматическим подбором диапазонов")
+    
+    auto_wfo_cols = st.columns([2, 1, 1, 1])
+    with auto_wfo_cols[0]:
+        run_auto_wfo_button = st.button(
+            "Запустить авто-подбор диапазонов и WFO",
+            key="run_auto_wfo",
+            type="primary",
+            help="Запускает двухэтапный процесс: 1. Широкая оптимизация на части данных для поиска робастных диапазонов. 2. Запуск WFO с найденными диапазонами."
+        )
+    with auto_wfo_cols[1]:
+        pre_opt_period_pct = st.slider(
+            "Период для разведки (%)", 
+            min_value=10, max_value=90, value=50, step=5, 
+            key="pre_opt_period_pct",
+            help="Процент от начала выбранных данных, который будет использован для первоначального широкого поиска диапазонов."
+        )
+    with auto_wfo_cols[2]:
+        top_trials_pct = st.slider(
+            "Топ проб для анализа (%)",
+            min_value=5, max_value=50, value=10, step=5,
+            key="top_trials_pct_for_ranges",
+            help="Процент лучших проб из этапа разведки, которые будут использованы для формирования новых, робастных диапазонов."
+        )
+    with auto_wfo_cols[3]:
+        pre_opt_trials = st.number_input(
+            "Проб для разведки",
+            value=100, min_value=10, step=10,
+            key="pre_opt_trials",
+            help="Количество проб Optuna для этапа широкого поиска (разведки)."
+        )
+
+    if run_auto_wfo_button:
+        if not dataframes:
+            st.warning("Пожалуйста, выберите хотя бы один Parquet-файл для WFO.")
+        else:
+            # Собираем все параметры, как для обычного WFO
+            combined_df = pd.concat(dataframes, ignore_index=True)
+            combined_df['datetime'] = pd.to_datetime(combined_df['time'], unit='s')
+            combined_df = combined_df.sort_values('datetime').reset_index(drop=True)
+
+            param_space = get_param_space_from_ui()
+            base_settings = {
+                'position_size': position_size, 'commission': commission,
+                'aggressive_mode': st.session_state.get("aggressive_mode_optimization", False),
+                'model_type': st.session_state.get("ml_model_type_optimization", "CatBoost")
+            }
+            wfo_params = {
+                'train_period': st.session_state.get("wfo_train_period", 7),
+                'test_period': st.session_state.get("wfo_test_period", 1),
+                'step_period': st.session_state.get("wfo_step_period", 1),
+                'trials_per_step': st.session_state.get("wfo_trials_per_step", 25),
+                'wfo_unit': st.session_state.get("wfo_unit", "Дни"),
+                'min_trades_threshold': st.session_state.get("wfo_min_trades_threshold", 10),
+            }
+            # Выбираем целевую функцию
+            strategy_objective_func = _get_objective_func(objective_choice, is_multi_objective)
+
+            # Запускаем новый процесс-оркестратор
+            wfo_optimizer.run_wfo_with_auto_ranges(
+                full_data=combined_df,
+                wfo_params=wfo_params,
+                base_settings=base_settings,
+                initial_param_space=param_space,
+                strategy_objective_func=strategy_objective_func,
+                pre_opt_period_pct=pre_opt_period_pct,
+                top_trials_pct_for_ranges=top_trials_pct,
+                n_trials_pre_opt=pre_opt_trials
+            )
+    # --- КОНЕЦ НОВОГО БЛОКА ---
+
     run_wfo_comparison_button = st.button(
         "⚡ Запустить WFO (ML vs. Baseline)",
         key="run_wfo_comparison",
@@ -520,20 +595,7 @@ def show_optimization_page():
             st.header("Сравнение WFO: ML-фильтр vs. Baseline")
 
             # --- ИСПРАВЛЕНИЕ: Выбираем целевую функцию на основе выбора пользователя ---
-            if "SQN" in objective_choice and not is_multi_objective:
-                strategy_objective_func = strategy_objectives.trading_strategy_objective_sqn
-            elif "Плавность Equity" in objective_choice:
-                strategy_objective_func = strategy_objectives.trading_strategy_objective_equity_curve_linearity
-            elif "HFT" in objective_choice:
-                strategy_objective_func = strategy_objectives.trading_strategy_objective_hft_score
-            elif "Качество данных для ML" in objective_choice:
-                strategy_objective_func = strategy_objectives.trading_strategy_objective_ml_data_quality
-            elif "ML" in objective_choice and is_multi_objective:
-                strategy_objective_func = strategy_objectives.trading_strategy_multi_objective_ml
-            elif is_multi_objective:
-                strategy_objective_func = strategy_objectives.trading_strategy_multi_objective
-            else: # По умолчанию, если что-то пошло не так
-                strategy_objective_func = strategy_objectives.trading_strategy_objective_sqn
+            strategy_objective_func = _get_objective_func(objective_choice, is_multi_objective)
 
             # --- Запуск 1: WFO с ML-фильтром ---
             st.subheader(f"1. Запуск WFO с ML-фильтром (цель: '{objective_choice}')")
@@ -614,6 +676,37 @@ def show_optimization_page():
             )
             # --- Конец нового блока ---
 
+def _get_objective_func(objective_choice, is_multi_objective):
+    """Вспомогательная функция для выбора целевой функции по названию из UI."""
+    if "SQN" in objective_choice and "ML" in objective_choice and is_multi_objective:
+    if "Calmar" in objective_choice and "ML" in objective_choice:
+        return strategy_objectives.trading_strategy_objective_calmar_ml
+    elif "Calmar" in objective_choice:
+        return strategy_objectives.trading_strategy_objective_calmar
+    elif "Прибыль" in objective_choice and "ML" in objective_choice and is_multi_objective:
+        return strategy_objectives.trading_strategy_multi_objective_advanced_ml
+    elif "Прибыль" in objective_choice and is_multi_objective:
+        return strategy_objectives.trading_strategy_multi_objective_advanced
+    elif "SQN" in objective_choice and "ML" in objective_choice and is_multi_objective:
+        return strategy_objectives.trading_strategy_multi_objective_ml
+    elif "SQN" in objective_choice and "ML" in objective_choice:
+        return strategy_objectives.trading_strategy_objective_ml
+    elif "SQN" in objective_choice and is_multi_objective:
+        return strategy_objectives.trading_strategy_multi_objective
+    elif "SQN" in objective_choice:
+        return strategy_objectives.trading_strategy_objective_sqn
+    elif "Плавность Equity" in objective_choice:
+        return strategy_objectives.trading_strategy_objective_equity_curve_linearity
+    elif "HFT" in objective_choice:
+        return strategy_objectives.trading_strategy_objective_hft_score
+    elif "Качество данных для ML" in objective_choice:
+        return strategy_objectives.trading_strategy_objective_ml_data_quality
+    elif is_multi_objective: # Общий случай многоцелевой
+        return strategy_objectives.trading_strategy_multi_objective
+    else: # По умолчанию
+        return strategy_objectives.trading_strategy_objective_sqn
+
+
     if st.session_state.get('optimization_running', False):
         if st.button("❌ Остановить оптимизацию", type="primary", key="stop_opt_button"):
             with open('stop_optimization.flag', 'w') as f:
@@ -643,20 +736,7 @@ def show_optimization_page():
             st.subheader("Результаты оптимизации Optuna")
             
             # Выбор целевой функции в зависимости от выбора пользователя
-            if "SQN" in objective_choice and not is_multi_objective:
-                strategy_objective_func = strategy_objectives.trading_strategy_objective_sqn
-            elif "Плавность Equity" in objective_choice:
-                strategy_objective_func = strategy_objectives.trading_strategy_objective_equity_curve_linearity
-            elif "HFT" in objective_choice:
-                strategy_objective_func = strategy_objectives.trading_strategy_objective_hft_score
-            elif "Качество данных для ML" in objective_choice:
-                strategy_objective_func = strategy_objectives.trading_strategy_objective_ml_data_quality
-            elif "ML" in objective_choice:
-                strategy_objective_func = strategy_objectives.trading_strategy_objective_ml
-            elif "ML" in objective_choice and is_multi_objective:
-                strategy_objective_func = strategy_objectives.trading_strategy_multi_objective_ml
-            else: # Многоцелевая
-                strategy_objective_func = strategy_objectives.trading_strategy_multi_objective
+            strategy_objective_func = _get_objective_func(objective_choice, is_multi_objective)
 
             opt_params_to_run = {
                 'data': combined_df, 'param_space': param_space, 'n_trials': optuna_trials,

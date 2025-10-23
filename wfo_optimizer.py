@@ -13,12 +13,23 @@ from joblib import Parallel, delayed
 import optuna_optimizer
 from trading_simulator import run_trading_simulation
 import streamlit as st
+import optuna
 import numpy as np
 # Импортируем ML-функции
 from signal_generator import generate_signals
 from ml_model_handler import label_all_signals, generate_features, train_ml_model
 
 from strategy_objectives import trading_strategy_objective_sqn, trading_strategy_objective_hft_score, trading_strategy_objective_ml_data_quality, trading_strategy_objective_ml, trading_strategy_multi_objective_ml, trading_strategy_multi_objective
+# --- ИСПРАВЛЕНИЕ: Импортируем ВСЕ возможные целевые функции ---
+# Это необходимо, чтобы функция _wfo_optimization_task могла восстановить любую
+# целевую функцию по её имени (strategy_func_name) в параллельных процессах.
+# Без этого globals().get(strategy_func_name) возвращал None, что приводило к ошибке.
+from strategy_objectives import (
+    trading_strategy_objective_sqn, trading_strategy_objective_hft_score,
+    trading_strategy_objective_ml_data_quality, trading_strategy_objective_ml,
+    trading_strategy_multi_objective_ml, trading_strategy_multi_objective,
+    trading_strategy_objective_equity_curve_linearity
+)
 def _wfo_optimization_task(task_params):
     """
     Вспомогательная функция для выполнения одной задачи оптимизации в параллельном режиме.
@@ -301,3 +312,179 @@ def run_wfo_parallel(
     }
 
     return {"summary": wfo_summary, "aggregated_metrics": aggregated_metrics, "equity_curve": equity_curve_df}
+
+def run_wfo_with_auto_ranges(
+    full_data: pd.DataFrame,
+    wfo_params: dict,
+    base_settings: dict,
+    initial_param_space: dict,
+    strategy_objective_func,
+    pre_opt_period_pct: int,
+    top_trials_pct_for_ranges: int,
+    n_trials_pre_opt: int
+):
+    """
+    Запускает WFO с автоматическим подбором робастных диапазонов.
+
+    Args:
+        full_data: Полный DataFrame с данными.
+        wfo_params: Параметры для WFO (размеры окон, шаг и т.д.).
+        base_settings: Базовые настройки симуляции (размер позиции, комиссия).
+        initial_param_space: Исходные (широкие) диапазоны для оптимизации.
+        strategy_objective_func: Целевая функция для оптимизации.
+        pre_opt_period_pct: Процент данных для этапа "разведки".
+        top_trials_pct_for_ranges: Процент лучших проб для анализа.
+        n_trials_pre_opt: Количество проб для этапа "разведки".
+    """
+    st.header("Этап 1: Поиск робастных диапазонов (Разведка)")
+
+    # 1. Выделяем данные для предварительной оптимизации
+    cutoff_index = int(len(full_data) * (pre_opt_period_pct / 100))
+    pre_opt_data = full_data.iloc[:cutoff_index].copy()
+    st.info(f"Для разведки используется {pre_opt_period_pct}% данных (до {pre_opt_data['datetime'].max().strftime('%Y-%m-%d')}).")
+
+    # 2. Запускаем широкую оптимизацию
+    with st.spinner(f"Запуск широкого поиска на {n_trials_pre_opt} проб..."):
+        pre_opt_params = {
+            'data': pre_opt_data,
+            'param_space': initial_param_space,
+            'n_trials': n_trials_pre_opt,
+            'strategy_func': strategy_objective_func,
+            'base_settings': base_settings,
+            'direction': 'maximize' # Предполагаем максимизацию для простоты
+        }
+        pre_opt_results = optuna_optimizer.run_optimization(pre_opt_params)
+
+    if not pre_opt_results or not pre_opt_results.get('study'):
+        st.error("Этап разведки не дал результатов. Невозможно определить робастные диапазоны.")
+        return
+
+    study = pre_opt_results['study']
+    # Отбираем только завершенные и успешные пробы
+    completed_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None]
+    
+    if not completed_trials:
+        st.error("На этапе разведки все пробы завершились с ошибкой. Невозможно определить робастные диапазоны.")
+        return
+
+    # 3. Анализируем результаты и создаем новые диапазоны
+    st.subheader("Результаты этапа разведки")
+    
+    # Сортируем пробы по значению (целевой метрике)
+    completed_trials.sort(key=lambda t: t.value, reverse=True)
+    
+    # Определяем количество лучших проб для анализа
+    num_top_trials = int(len(completed_trials) * (top_trials_pct_for_ranges / 100))
+    top_trials = completed_trials[:num_top_trials]
+
+    st.info(f"Анализ {len(top_trials)} лучших проб (топ {top_trials_pct_for_ranges}%) для определения новых диапазонов.")
+
+    new_param_space = {}
+    params_summary = []
+
+    # --- НОВЫЙ БЛОК: Определяем абсолютные минимальные значения для параметров ---
+    # Эти значения будут служить "последним рубежом", ниже которого
+    # автоматический подбор диапазонов опуститься не сможет.
+    ABSOLUTE_MINIMUMS = {
+        "vol_period": 1, "vol_pctl": 1,
+        "range_period": 1, "rng_pctl": 1,
+        "natr_period": 1, "natr_min": 0.01,
+        "lookback_period": 1, "min_growth_pct": -100.0,
+        "stop_loss_pct": 0.01, "take_profit_pct": 0.01,
+        "bracket_offset_pct": 0.01, "bracket_timeout_candles": 1,
+        "ml_iterations": 10, "ml_depth": 2,
+        "ml_epochs": 5, "ml_hidden_size": 16, "ml_num_hidden_layers": 1,
+        "ml_batch_size": 16, "ml_dropout_rate": 0.01,
+        "ml_learning_rate": 0.0001,
+        "ml_prints_window": 1, "ml_labeling_timeout_candles": 1,
+    }
+    # --- КОНЕЦ НОВОГО БЛОКА ---
+
+    for param_name, p_space in initial_param_space.items():
+        p_type, initial_low, initial_high = p_space[0], p_space[1], p_space[2]
+        if p_type in ["int", "float"] and param_name in study.best_trial.params:
+            best_value = study.best_trial.params[param_name]
+            initial_spread = initial_high - initial_low
+
+            # --- НОВАЯ ЛОГИКА: Расчет "разброса" для нового диапазона ---
+            # 1. Определяем, является ли исходный диапазон "узким"
+            # Считаем диапазон узким, если его ширина меньше 20% от его среднего значения.
+            # Добавляем 1e-6, чтобы избежать деления на ноль.
+            is_narrow_range = initial_spread < ((initial_low + initial_high) / 2) * 0.2
+
+            # 2. Рассчитываем "разброс" (spread)
+            if is_narrow_range:
+                # Если диапазон узкий, берем % от самого значения, чтобы его расширить
+                spread = max(1 if p_type == "int" else 0.01, abs(best_value) * 0.20) # 20% от значения
+            else:
+                # Если диапазон широкий, берем % от его ширины, чтобы сузить
+                spread = initial_spread * 0.25 # 25% от ширины
+
+            # 3. Определяем новые границы, центрированные вокруг лучшего значения
+            new_low_raw = best_value - spread
+            new_high_raw = best_value + spread
+
+            # 4. Ограничиваем новые границы
+            # Получаем абсолютный минимум для этого параметра
+            abs_min = ABSOLUTE_MINIMUMS.get(param_name, initial_low)
+
+            if is_narrow_range:
+                # Для узких диапазонов позволяем расширение, но не ниже абсолютного минимума.
+                new_low = max(abs_min, new_low_raw)
+                new_high = new_high_raw
+            else:
+                # Для широких диапазонов остаемся внутри исходных рамок (которые уже учитывают abs_min).
+                new_low = max(initial_low, new_low_raw)
+                new_high = min(initial_high, new_high_raw)
+
+            # 5. Финальная корректировка для int и float
+            if p_type == "int":
+                new_low = int(np.floor(new_low))
+                new_high = int(np.ceil(new_high))
+                # Гарантируем, что диапазон не пустой и корректен
+                if new_low >= new_high:
+                    new_high = new_low + 1
+                new_param_space[param_name] = (p_type, new_low, new_high)
+            else: # float
+                if np.isclose(new_low, new_high):
+                    new_high = new_high + 0.01
+                new_param_space[param_name] = (p_type, new_low, new_high)
+            
+            params_summary.append({"Параметр": param_name, "Старый диапазон": f"{initial_low} - {initial_high}", "Новый диапазон": f"{new_low} - {new_high}"})
+        else: # Категориальные или отсутствующие в лучших пробах параметры оставляем без изменений
+            new_param_space[param_name] = p_space
+            if param_name not in study.best_trial.params:
+                continue
+
+    st.dataframe(pd.DataFrame(params_summary), use_container_width=True)
+
+    # 4. Запускаем WFO с новыми, "робастными" диапазонами
+    st.header("Этап 2: Запуск Walk-Forward Optimization с робастными диапазонами")
+    opt_params_for_wfo = {
+        'param_space': new_param_space,
+        'strategy_func': strategy_objective_func,
+        'direction': 'maximize', # Упрощаем для примера
+        'base_settings': base_settings
+    }
+
+    # --- ИСПРАВЛЕНИЕ: Проверяем, является ли цель ML-ориентированной, и устанавливаем флаг ---
+    # Это гарантирует, что на втором этапе (WFO) будет правильно обучаться и применяться ML-модель.
+    is_ml_wfo = "ml" in strategy_objective_func.__name__
+    if is_ml_wfo:
+        opt_params_for_wfo['is_ml_wfo'] = True
+        st.info("Обнаружена ML-цель. На каждом шаге WFO будет обучаться и применяться ML-фильтр.")
+    
+    # Запускаем стандартный параллельный WFO
+    wfo_results = run_wfo_parallel(full_data, wfo_params, opt_params_for_wfo)
+
+    # --- НОВЫЙ БЛОК: Отображение результатов WFO после завершения ---
+    if wfo_results and wfo_results.get('summary'):
+        st.success("WFO с автоматическим подбором диапазонов успешно завершен!")
+        from visualizer import plot_wfo_results, plot_wfo_parameter_stability, plot_wfo_insample_vs_outsample
+        summary_df = pd.DataFrame(wfo_results['summary'])
+        st.dataframe(summary_df)
+        st.plotly_chart(plot_wfo_results(summary_df, wfo_results['equity_curve'], wfo_results['aggregated_metrics']), use_container_width=True)
+        st.plotly_chart(plot_wfo_parameter_stability(summary_df, new_param_space), use_container_width=True)
+        st.plotly_chart(plot_wfo_insample_vs_outsample(summary_df), use_container_width=True)
+    else:
+        st.error("WFO с автоматическим подбором диапазонов не дал результатов.")
